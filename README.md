@@ -61,12 +61,12 @@ services:
 
 ### Available Docker tags
 
-Release images and automatic builds use separate tags. The image is built on top of the upstream server image (`ghcr.io/music-assistant/server`), and a change in that base image can break the provider at any time. Release images pass the test suite before they are published. Automatic builds are republished without tests whenever their base image or the provider code changes.
+Release images and automatic builds use separate tags. The image is built on top of the upstream server image (`ghcr.io/music-assistant/server`), and a change in that base image can break the provider at any time. Release images pass the test suite before they are published. Automatic builds are republished when their base image or the provider code changes, without waiting for the test suite to pass.
 
 > [!IMPORTANT]
-> **Tag changes on 2026-09-25.** `:latest` used to be rebuilt at least once a week from the current `main` code on the newest upstream server image. It now moves only when a stable provider release is published, so between releases it keeps the server version it was built with. To keep receiving server updates the way `:latest` did before, switch to `:edge`.
+> **Tag changes on 2026-09-25.** `:latest` used to be rebuilt from the current `main` code on the newest upstream server image, by a weekly scheduled job and on every push to `main` that changed the provider. It now moves only when a stable provider release is published, so between releases it keeps the server version it was built with. To keep receiving server updates the way `:latest` did before, switch to `:edge`.
 >
-> Release tags also drop the `v` prefix from the next release on (`:1.2.0` instead of `:v1.2.0`). The `:<version>-latest`, `:<version>-beta`, `:latest-<run_id>` and `:beta-<run_id>` tags are no longer published. Existing tags stay pullable.
+> Release tags also drop the `v` prefix from the next release on (`:1.2.0` instead of `:v1.2.0`). The `:v<version>-latest` and `:v<version>-beta` tags (such as `:v1.1.4-latest`) and the `:latest-<run_id>` and `:beta-<run_id>` tags are no longer published. Existing tags stay pullable.
 
 #### Release images (tested)
 
@@ -77,11 +77,11 @@ Published only by the release workflow when a `v*` git tag is pushed to this rep
 | `:<version>` (e.g. `:1.2.0`) | The release image for that git tag, without the `v` prefix. A prerelease such as `v1.2.0-rc.1` publishes `:1.2.0-rc.1`. |
 | `:latest` | The most recent stable release. Prereleases never move it. **Recommended for production.** |
 
-"Tested" means the release passed the CI test suite, which builds and checks the amd64 image. The arm64 image is built from the same code but is not run in CI.
+"Tested" means the release commit passed the CI test suite. That suite builds its own amd64 copy of the image on the upstream `server:latest` image and checks that the provider is installed and imports against the real server. The published images are built afterwards in a separate job, and the arm64 image is never run in CI.
 
 #### Automatic builds (untested)
 
-A daily job rebuilds each of these tags when its upstream base image changed or when the provider code or Dockerfile changed since its last build. A push to `main` that touches the provider, the Dockerfile or the image workflow rebuilds all three right away. Documentation changes alone never trigger a rebuild. Use these tags at your own risk.
+A daily job rebuilds `:edge`, `:beta` and `:nightly`, each one only when its upstream base image, the provider code or the Dockerfile has changed since its last build. A push to `main` that touches the provider, the Dockerfile or the image workflow rebuilds all of them right away. Documentation changes alone never trigger a rebuild. Use these tags at your own risk.
 
 | Tag | Base image | Description |
 | --- | --- | --- |
@@ -91,7 +91,7 @@ A daily job rebuilds each of these tags when its upstream base image changed or 
 | `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. `:edge-20260925-a1b2c3d-1234567890`) | Same as `<tag>` | One companion tag per build (build date, commit short SHA, workflow run id), for rolling back to that build. |
 
 > [!NOTE]
-> The image was previously published as `ghcr.io/sproft/music-assistant-ytmusic`. That name is retired: existing tags stay pullable so running deployments keep working, but new builds are published only under the name above, so switch your compose file when convenient.
+> The image was previously published as `ghcr.io/sproft/music-assistant-ytmusic`. That name is retired. Its existing tags stay pullable, so running deployments keep working. New builds are published only as `ghcr.io/sproft/ytmusic-free-provider`, so switch your compose file when convenient.
 >
 > For reproducible deployments, pin to a `@sha256:` digest. It is the only pin that can never change. `:<version>` and the companion tags are stable in normal use, but re-running a build job publishes a fresh image under the same tag, built on whatever base image is current at that moment.
 
