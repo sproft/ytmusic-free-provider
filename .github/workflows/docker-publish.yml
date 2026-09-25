@@ -1,9 +1,45 @@
-name: Build and Publish Latest and Beta Tags
+name: Build and Publish Docker Images
+
+# Builds the Music Assistant + ytmusic_free provider image. Official
+# releases and automatic (untested) builds use strictly separated tags:
+#
+# Official releases (via release.yml, considered TESTED):
+#   :<version>  (git tag without the `v` prefix, e.g. :2.1.0)
+#   :latest     (moving tag, only set for stable - non-prerelease - releases)
+#   Base image: ghcr.io/music-assistant/server:latest, MA_VERSION=latest,
+#   provider code from the build context (the tagged commit).
+#
+# Automatic builds (schedule / push to main / manual dispatch, UNTESTED):
+#   :edge    -> base image ghcr.io/music-assistant/server:latest  (stable 2.X releases)
+#   :beta    -> base image ghcr.io/music-assistant/server:beta    (2.X.0b*/rc pre-releases)
+#   :nightly -> base image ghcr.io/music-assistant/server:nightly (2.X.0.dev* builds)
+#   Each also gets an immutable rollback companion tag
+#   `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. :edge-20260831-a1b2c3d-1234567890).
+#
+# The tag separation exists because a change in the upstream base image can
+# break the plugin at any time; only official tag-push releases are tested.
+#
+# Every variant - releases included - takes the provider code from the build
+# context (the checked-out commit of this repository), so the beta/nightly
+# legs always contain the code that was current when they ran. There is no
+# option to pull the provider from a different plugin branch.
+#
+# Digest change detection:
+#   For each variant the current digest of the moving base-image tag is
+#   compared against the annotations stamped on the previously published
+#   image (`org.opencontainers.image.base.digest` and
+#   `org.opencontainers.image.revision`). The revision records the last
+#   commit that touched the build inputs, so docs-only commits do not force
+#   rebuilds. Both must match to skip the build; this also re-builds
+#   variants whose previous push build failed (the revision annotation still
+#   points at the older commit). Release builds skip this check entirely.
+#   The decision logic lives in .github/scripts/evaluate_build_matrix.sh.
 
 on:
   schedule:
-    # Runs every Sunday at 04:00 AM UTC to catch new updates
-    - cron: '0 4 * * 0'
+    # Daily at 06:41 AM UTC (offset from the full hour, clear of the 06:23
+    # test.yml cron) to catch new base image updates.
+    - cron: '41 6 * * *'
   push:
     branches: [ "main" ]
     paths:
@@ -11,9 +47,10 @@ on:
       - 'Dockerfile'
       - '.dockerignore'
       - '.github/workflows/docker-publish.yml'
-  # Called by release.yml on a version tag. Reusable rather than a `tags:` entry
-  # under `push:` above, because `paths:` applies to every push filter and a tag
-  # push has no path diff to match, so the build would silently never run.
+      - '.github/scripts/evaluate_build_matrix.sh'
+  # Version tag pushes are handled by release.yml, which calls this workflow
+  # via `workflow_call` (a tag push has no path diff, so a `paths:`-filtered
+  # `tags:` entry under `push:` above would never run).
   workflow_call:
     inputs:
       release_tag:
@@ -24,7 +61,16 @@ on:
         required: false
         default: ""
   workflow_dispatch:
-    # Allows manual triggers
+    # Manual trigger. Restricted to the main branch via a ref guard in the
+    # check job. By default a manual run behaves like the scheduled run
+    # (skips variants whose base digest and revision are unchanged); set
+    # force_build=true to always build all variants.
+    inputs:
+      force_build:
+        description: 'Force build even if base digest and revision are unchanged'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: docker-publish-${{ github.ref }}
@@ -32,19 +78,61 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
+  BASE_IMAGE_LATEST: ghcr.io/music-assistant/server:latest
+  BASE_IMAGE_BETA: ghcr.io/music-assistant/server:beta
+  BASE_IMAGE_DEV: ghcr.io/music-assistant/server:nightly
+  ANNOTATION_BASE_DIGEST: org.opencontainers.image.base.digest
+  ANNOTATION_REVISION: org.opencontainers.image.revision
 
 jobs:
-  build-and-push:
+  check:
+    name: Decide which variants to build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.decision.outputs.matrix }}
+      has_builds: ${{ steps.decision.outputs.has_builds }}
+    steps:
+      - name: Checkout repository
+        # Full history: the check script resolves the last commit that touched
+        # the build inputs (`git log -- <paths>`), which needs more than the
+        # default shallow depth-1 checkout.
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Collect base digests and decide builds
+        id: decision
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          RUN_ID: ${{ github.run_id }}
+          FORCE_BUILD: ${{ inputs.force_build || 'false' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REGISTRY: ${{ env.REGISTRY }}
+          BASE_IMAGE_LATEST: ${{ env.BASE_IMAGE_LATEST }}
+          BASE_IMAGE_BETA: ${{ env.BASE_IMAGE_BETA }}
+          BASE_IMAGE_DEV: ${{ env.BASE_IMAGE_DEV }}
+          ANNOTATION_BASE_DIGEST: ${{ env.ANNOTATION_BASE_DIGEST }}
+          ANNOTATION_REVISION: ${{ env.ANNOTATION_REVISION }}
+        run: bash .github/scripts/evaluate_build_matrix.sh
+
+  build:
+    name: Build ${{ matrix.variant }} image
+    needs: check
+    if: needs.check.outputs.has_builds == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      matrix:
-        # Adjusted to match the exact upstream channels
-        version: [latest, beta]
     permissions:
       contents: read
       packages: write
-
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.check.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -65,29 +153,39 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Materialise the input as an env var so the tag expressions below compare
-      # a real string. On push/schedule/dispatch runs `inputs` is empty and this
-      # writes RELEASE_TAG= (empty), with no reliance on how GitHub coerces null.
-      - name: Resolve release tag
-        run: echo "RELEASE_TAG=${{ inputs.release_tag }}" >> "$GITHUB_ENV"
-
       - name: Extract Docker metadata (for immutable tags)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # matrix.version is the UPSTREAM Music Assistant channel, so `:latest`
-          # here means "built on music-assistant/server:latest", not "newest
-          # ytmusic_free". Release builds must not reuse those names, so they add
-          # their own:
-          #   v1.0.0-latest  provider v1.0.0 on the MA latest channel
-          #   v1.0.0-beta    provider v1.0.0 on the MA beta channel
-          #   v1.0.0         alias for the latest-channel build
-          tags: |
-            type=raw,value=${{ matrix.version }}
-            type=raw,value=${{ matrix.version }}-${{ github.run_id }}
-            type=raw,value=${{ env.RELEASE_TAG }}-${{ matrix.version }},enable=${{ env.RELEASE_TAG != '' }}
-            type=raw,value=${{ env.RELEASE_TAG }},enable=${{ env.RELEASE_TAG != '' && matrix.version == 'latest' }}
+          # matrix.tags is a newline-separated list of raw tags produced by
+          # the check job (e.g. "2.1.0\nlatest" for releases or
+          # "edge\nedge-YYYYMMDD-<shortsha>-<run_id>" for automatic builds).
+          tags: ${{ matrix.tags }}
+
+      # Buildx accepts index/manifest-descriptor annotations only on a
+      # multi-platform push; every leg of this workflow pushes, so they are
+      # set unconditionally. The matrix values are passed through env instead
+      # of direct ${{ }} interpolation inside the shell, so no external value
+      # is ever evaluated as part of the script.
+      - name: Compute image labels and annotations
+        id: img
+        env:
+          BASE_DIGEST: ${{ matrix.base_digest }}
+          REVISION: ${{ matrix.revision }}
+        run: |
+          {
+            echo "labels<<LABELS_EOF"
+            echo "${ANNOTATION_BASE_DIGEST}=${BASE_DIGEST}"
+            echo "${ANNOTATION_REVISION}=${REVISION}"
+            echo "LABELS_EOF"
+            echo "annotations<<ANNOTATIONS_EOF"
+            echo "index:${ANNOTATION_BASE_DIGEST}=${BASE_DIGEST}"
+            echo "index:${ANNOTATION_REVISION}=${REVISION}"
+            echo "manifest-descriptor:${ANNOTATION_BASE_DIGEST}=${BASE_DIGEST}"
+            echo "manifest-descriptor:${ANNOTATION_REVISION}=${REVISION}"
+            echo "ANNOTATIONS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -97,6 +195,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
-            MA_VERSION=${{ matrix.version }}
-          cache-from: type=gha,scope=${{ matrix.version }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.version }}
+            MA_VERSION=${{ matrix.ma_version }}
+          labels: ${{ steps.img.outputs.labels }}
+          # Store the annotations on the index and per-platform manifest
+          # descriptors so the next scheduled run can read them via
+          # `docker buildx imagetools inspect --raw` (see the step above).
+          annotations: ${{ steps.img.outputs.annotations }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}

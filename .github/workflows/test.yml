@@ -42,6 +42,10 @@ jobs:
           shellcheck -s sh tests/test_install_watcher_addon.sh
           shellcheck -s sh scripts/install_provider.sh
           shellcheck -s sh tests/test_install_provider.sh
+          # bash syntax: the script uses bash-only features (associative
+          # arrays, substring expansion) and runs under the GitHub runner's
+          # bash, not under dash.
+          shellcheck -s bash .github/scripts/evaluate_build_matrix.sh
 
       - name: Run installer test suite (POSIX sh, dash)
         run: |
@@ -129,10 +133,23 @@ jobs:
   docker-lint-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The beta/nightly legs are advisory: the upstream base image they track
+    # can break independently of anything in this repo, and a red advisory
+    # job would block release.yml's publish gate (which calls this workflow).
+    # Only the latest leg - the one releases build on - is a hard blocker.
+    continue-on-error: ${{ matrix.ma_version != 'latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Test against all moving base-image tags so changes in the
+        # container setup of the upstream base image (beta/nightly) are
+        # caught early, not only after publishing.
+        ma_version: [latest, beta, nightly]
     steps:
       - uses: actions/checkout@v7
 
       - name: Lint Dockerfile (Hadolint)
+        if: matrix.ma_version == 'latest'
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
@@ -146,27 +163,16 @@ jobs:
           context: .
           push: false
           load: true # Loads image into local docker daemon for inspection
-          tags: local-test-image:latest
-          build-args: MA_VERSION=latest
+          tags: local-test-image:${{ matrix.ma_version }}
+          build-args: MA_VERSION=${{ matrix.ma_version }}
 
       - name: Assert provider files exist in site-packages
         run: |
-          # Spin up the built container and verify the provider directory exists in the computed venv path
-          # We use --entrypoint sh to override the default "mass" entrypoint of the image
-          docker run --rm --entrypoint sh local-test-image:latest -c '
-            PYVER=""
-            
-            # Clean POSIX alternative to ls | grep
-            for d in /app/venv/lib/python3.*/; do
-              if [ -d "$d" ]; then
-                PYVER=$(basename "$d")
-                break
-              fi
-            done
-            
-            [ -z "$PYVER" ] && PYVER="python3.13"
-            
-            TARGET_DIR="/app/venv/lib/$PYVER/site-packages/music_assistant/providers/ytmusic_free"
+          # Spin up the built container and verify the provider directory
+          # exists in the site-packages path resolved via Python itself.
+          # We use --entrypoint sh to override the default "mass" entrypoint.
+          docker run --rm --entrypoint sh local-test-image:${{ matrix.ma_version }} -c '
+            TARGET_DIR="$( /app/venv/bin/python -c "import sysconfig; print(sysconfig.get_path(\"purelib\"))" )/music_assistant/providers/ytmusic_free"
             echo "Checking path: $TARGET_DIR"
             if [ -d "$TARGET_DIR" ] && [ -f "$TARGET_DIR/manifest.json" ]; then
               echo "Success: Provider files verified in venv."
@@ -192,4 +198,4 @@ jobs:
           # no path arithmetic; see tests/verify_server_contract.py for what it
           # asserts and why.
           docker run --rm -i --entrypoint /app/venv/bin/python \
-            local-test-image:latest - < tests/verify_server_contract.py
+            local-test-image:${{ matrix.ma_version }} - < tests/verify_server_contract.py
