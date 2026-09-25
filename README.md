@@ -61,42 +61,39 @@ services:
 
 ### Available Docker tags
 
-Official releases and automatic builds use **strictly separated tags**. This separation exists because the plugin is built on top of a moving upstream base image (`ghcr.io/music-assistant/server`): a change in that base image can break the plugin at any time. Only official releases, created by pushing a git tag in this repository, are tested - automatic builds are rebuilt whenever the base image changes and are therefore **untested**.
+Release images and automatic builds use separate tags. The image is built on top of the upstream server image (`ghcr.io/music-assistant/server`), and a change in that base image can break the provider at any time. Release images pass the test suite before they are published. Automatic builds are republished without tests whenever their base image or the provider code changes.
 
-> [!NOTE]
-> **Tag semantics**
-> - `:latest` points at the most recent tested **stable** release and is set only by release builds. Prereleases (`v1.2.3-rc.1`) publish `:1.2.3-rc.1` but never move `:latest`.
-> - The rolling, untested channel builds are `:edge` (MA latest channel), `:beta` (MA beta channel) and `:nightly` (MA nightly channel), rebuilt daily.
-> - Release images are tagged `:<version>` (e.g. `:1.2.3`) rather than `:<version>-latest` / `:<version>-beta`; per-build pins are the immutable companion tags `:<tag>-YYYYMMDD-<shortsha>-<run_id>`.
+> [!IMPORTANT]
+> **Tag changes on 2026-09-25.** `:latest` used to be rebuilt at least once a week from the current `main` code on the newest upstream server image. It now moves only when a stable provider release is published, so between releases it keeps the server version it was built with. To keep receiving server updates the way `:latest` did before, switch to `:edge`.
+>
+> Release tags also drop the `v` prefix from the next release on (`:1.2.0` instead of `:v1.2.0`). The `:<version>-latest`, `:<version>-beta`, `:latest-<run_id>` and `:beta-<run_id>` tags are no longer published. Existing tags stay pullable.
 
-#### Official releases (tested)
+#### Release images (tested)
 
-Built **only** by the release workflow, triggered by pushing a git tag `v*` to this repository. Base image: `ghcr.io/music-assistant/server:latest`.
+Published only by the release workflow when a `v*` git tag is pushed to this repository. Base image: `ghcr.io/music-assistant/server:latest` as it was on the release day.
 
 | Tag | Description |
 | --- | --- |
-| `:<version>` (e.g. `:2.1.0`) | The tested release image, pinned to the git tag (without the `v` prefix). |
-| `:latest` | Moving tag pointing at the most recent tested **stable** release; not set by prerelease versions. **Recommended for production.** |
+| `:<version>` (e.g. `:1.2.0`) | The release image for that git tag, without the `v` prefix. A prerelease such as `v1.2.0-rc.1` publishes `:1.2.0-rc.1`. |
+| `:latest` | The most recent stable release. Prereleases never move it. **Recommended for production.** |
+
+"Tested" means the release passed the CI test suite, which builds and checks the amd64 image. The arm64 image is built from the same code but is not run in CI.
 
 #### Automatic builds (untested)
 
-Rebuilt automatically (daily schedule and on pushes to `main`) whenever the upstream base image changes. A base-image update can break the plugin at any time - use at your own risk.
+A daily job rebuilds each of these tags when its upstream base image changed or when the provider code or Dockerfile changed since its last build. A push to `main` that touches the provider, the Dockerfile or the image workflow rebuilds all three right away. Documentation changes alone never trigger a rebuild. Use these tags at your own risk.
 
 | Tag | Base image | Description |
 | --- | --- | --- |
-| `:edge` | `ghcr.io/music-assistant/server:latest` | Rolling build for stable Music Assistant releases. **Untested.** |
-| `:beta` | `ghcr.io/music-assistant/server:beta` | Rolling build for MA beta pre-releases (`2.X.0b*`/rc). **Untested.** |
-| `:nightly` | `ghcr.io/music-assistant/server:nightly` | Rolling build for MA nightly dev builds (`2.X.0.dev*`). **Untested.** |
-| `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. `:edge-20260831-a1b2c3d-1234567890`) | — | Immutable companion tags for rollback, one per build (build date + commit short SHA + workflow run id). |
+| `:edge` | `ghcr.io/music-assistant/server:latest` | Current `main` on the upstream stable server. This is the successor of the old `:latest`. **Untested.** |
+| `:beta` | `ghcr.io/music-assistant/server:beta` | Current `main` on the upstream beta server. **Untested.** |
+| `:nightly` | `ghcr.io/music-assistant/server:nightly` | Current `main` on the upstream nightly server. **Untested.** |
+| `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. `:edge-20260925-a1b2c3d-1234567890`) | Same as `<tag>` | One companion tag per build (build date, commit short SHA, workflow run id), for rolling back to that build. |
 
 > [!NOTE]
-> The `:latest` tag is reserved for official, tested releases and is never touched by automatic builds. If you want to live dangerously and track automatic builds, use `:edge` instead.
->
 > The image was previously published as `ghcr.io/sproft/music-assistant-ytmusic`. That name is retired: existing tags stay pullable so running deployments keep working, but new builds are published only under the name above, so switch your compose file when convenient.
 >
-> For reproducible deployments, pin to an immutable tag such as `:<version>`, `:edge-YYYYMMDD-<shortsha>-<run_id>`, or a specific `@sha256:` digest.
->
-> The daily build checks the base image digest and the stamped commit revision; variants are only rebuilt when the base image changed or a previous build was missed. The revision records the last commit that touched the build inputs (`ytmusic_free`, `Dockerfile`, `.dockerignore`), so docs-only commits do not force a rebuild.
+> For reproducible deployments, pin to a `@sha256:` digest. It is the only pin that can never change. `:<version>` and the companion tags are stable in normal use, but re-running a build job publishes a fresh image under the same tag, built on whatever base image is current at that moment.
 
 ## Installation: Home Assistant OS
 
