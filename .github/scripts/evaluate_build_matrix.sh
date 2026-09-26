@@ -12,6 +12,10 @@
 # Outputs:
 #   matrix     - JSON object {"include": [...]} for the build job matrix
 #   has_builds - "true" when at least one variant should be built
+#   unresolved - space-separated automatic variants whose base image could
+#                not be resolved this run (empty when all resolved)
+#
+# Tested by tests/test_evaluate_build_matrix.sh.
 set -euo pipefail
 
 # --- Inputs (environment) ----------------------------------------------------
@@ -21,6 +25,7 @@ GIT_REF="${GIT_REF:-}"                              # github.ref
 GIT_REF_TYPE="${GIT_REF_TYPE:-}"                    # github.ref_type
 RELEASE_TAG="${RELEASE_TAG:-}"                      # release_tag workflow_call input (set by release.yml)
 RUN_ID="${RUN_ID:-}"                                # github.run_id, part of the companion tag suffix
+LOOKUP_TIMEOUT="${LOOKUP_TIMEOUT:-60}"              # seconds allowed per registry lookup
 FORCE_BUILD="${FORCE_BUILD:-false}"                 # workflow_dispatch input
 REGISTRY="${REGISTRY:?REGISTRY is required}"
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
@@ -32,7 +37,9 @@ ANNOTATION_REVISION="${ANNOTATION_REVISION:?ANNOTATION_REVISION is required}"
 
 # Companion tag suffix for rollback: <tag>-YYYYMMDD-<shortsha>-<run_id>.
 # The run id keeps the tag unique even for several builds of the same commit
-# on the same day. Empty run id (local testing) leaves it off.
+# on the same day. Empty run id (local testing) leaves it off. The build job
+# appends -<attempt> on re-runs; it has to happen there, because a partial
+# re-run reuses this job's outputs from the first attempt.
 COMPANION_SUFFIX="$(date -u +%Y%m%d)-${SHA::7}"
 if [ -n "$RUN_ID" ]; then
   COMPANION_SUFFIX="${COMPANION_SUFFIX}-${RUN_ID}"
@@ -47,14 +54,22 @@ LAST_BUILD_COMMIT="$(git log -1 --format=%H -- ytmusic_free Dockerfile .dockerig
 
 # Resolve the real multi-arch index digest (a `sha256:...` digest) of an
 # image tag. Stable across architectures and independent of the local
-# platform.
+# platform. Returns 1 when the lookup fails, hangs past LOOKUP_TIMEOUT or
+# prints something that is not a digest. The status is checked explicitly
+# because get_digest always runs inside $( ), where bash clears set -e.
 get_digest() {
   local digest
-  digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1")"
-  if [ -z "$digest" ]; then
-    echo "ERROR: empty digest for '$1'" >&2
-    exit 1
+  if ! digest="$(timeout "$LOOKUP_TIMEOUT" docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1")"; then
+    echo "ERROR: could not resolve '$1'" >&2
+    return 1
   fi
+  case "$digest" in
+    sha256:*) ;;
+    *)
+      echo "ERROR: unexpected digest '$digest' for '$1'" >&2
+      return 1
+      ;;
+  esac
   printf '%s' "$digest"
 }
 
@@ -63,7 +78,7 @@ get_digest() {
 # or the annotation does not exist yet).
 get_annotations() {
   local image="$1" raw digest revision
-  if raw="$(docker buildx imagetools inspect --raw "$image" 2>/dev/null)"; then
+  if raw="$(timeout "$LOOKUP_TIMEOUT" docker buildx imagetools inspect --raw "$image" 2>/dev/null)"; then
     digest="$(printf '%s' "$raw" | jq -r --arg k "$ANNOTATION_BASE_DIGEST" \
       '.annotations[$k] // empty, (.manifests[]? | .annotations[$k] // empty)' 2>/dev/null | head -n1 || true)"
     revision="$(printf '%s' "$raw" | jq -r --arg k "$ANNOTATION_REVISION" \
@@ -74,7 +89,8 @@ get_annotations() {
 
 # Compare a variant against its published image: build when either the base
 # digest or the stamped revision differs (or nothing was published yet).
-# This also catches builds missed because a previous push build failed.
+# This also catches a build missed because a previous push build failed, as
+# long as that push changed the build inputs.
 needs_build() {
   local base_digest="$1" pub="$2"
   local pub_digest="${pub%% *}" pub_rev="${pub#* }"
@@ -106,9 +122,11 @@ fi
 # (non-prerelease) releases, the moving `latest` tag. No digest-skip check
 # applies.
 #
-# release.yml calls this workflow with the release_tag input while
-# github.event_name is "workflow_call", so the input is the primary signal;
-# a direct tag push to this workflow is kept as a defensive fallback.
+# release.yml calls this workflow with the release_tag input. A called
+# workflow sees the caller's github context, so github.event_name is "push"
+# (the tag push that started release.yml) and the input is the primary
+# signal. A direct tag push to this workflow is kept as a defensive fallback.
+# A release that cannot resolve its base image fails the run outright.
 TAG_NAME="${RELEASE_TAG}"
 if [ -z "$TAG_NAME" ] && [ "$EVENT" = "push" ] && [ "$GIT_REF_TYPE" = "tag" ]; then
   TAG_NAME="${GIT_REF#refs/tags/}"
@@ -136,6 +154,7 @@ if [ -n "$TAG_NAME" ]; then
       variant: "release",
       ma_version: "latest",
       tags: $tags,
+      companion: "",
       base_digest: $base_digest,
       revision: $revision
     }]
@@ -157,8 +176,15 @@ declare -A BASE_IMAGE=(
 declare -A MA_VERSION=( [edge]=latest [beta]=beta [nightly]=nightly )
 
 legs="[]"
+unresolved=()
 for variant in edge beta nightly; do
-  base_digest="$(get_digest "${BASE_IMAGE[$variant]}")"
+  # One unreachable or withdrawn base image skips only its own variant. The
+  # others still build, and the workflow's report job turns the run red.
+  if ! base_digest="$(get_digest "${BASE_IMAGE[$variant]}")"; then
+    echo "::error::Could not resolve ${BASE_IMAGE[$variant]}; skipping the $variant variant this run."
+    unresolved+=("$variant")
+    continue
+  fi
   published_image="$REGISTRY/${GITHUB_REPOSITORY,,}:${variant}"
   pub="$(get_annotations "$published_image")"
   pub_digest="${pub%% *}"
@@ -175,6 +201,10 @@ for variant in edge beta nightly; do
         build=true
       fi
       ;;
+    *)
+      # Any other event (for example a future caller started by
+      # pull_request) builds nothing.
+      ;;
   esac
 
   echo "variant=$variant base_digest=$base_digest published=($pub_digest, ${pub_rev:-<none>}) should_build=$build"
@@ -183,13 +213,15 @@ for variant in edge beta nightly; do
     legs="$(printf '%s' "$legs" | jq -c \
       --arg variant "$variant" \
       --arg ma_version "${MA_VERSION[$variant]}" \
-      --arg tags "$(printf '%s\n%s-%s' "$variant" "$variant" "$COMPANION_SUFFIX")" \
+      --arg tags "$variant" \
+      --arg companion "$variant-$COMPANION_SUFFIX" \
       --arg base_digest "$base_digest" \
       --arg revision "$LAST_BUILD_COMMIT" \
       '. + [{
         variant: $variant,
         ma_version: $ma_version,
         tags: $tags,
+        companion: $companion,
         base_digest: $base_digest,
         revision: $revision
       }]')"
@@ -198,6 +230,7 @@ done
 
 MATRIX="$(jq -nc --argjson include "$legs" '{include: $include}')"
 emit "matrix" "$MATRIX"
+emit "unresolved" "${unresolved[*]}"
 if [ "$legs" = "[]" ]; then
   emit "has_builds" "false"
   echo "All variants are up to date - nothing to build."

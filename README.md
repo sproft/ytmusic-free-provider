@@ -88,12 +88,12 @@ A daily job rebuilds `:edge`, `:beta` and `:nightly`, each one only when its ups
 | `:edge` | `ghcr.io/music-assistant/server:latest` | Current `main` on the upstream stable server. This is the successor of the old `:latest`. **Untested.** |
 | `:beta` | `ghcr.io/music-assistant/server:beta` | Current `main` on the upstream beta server. **Untested.** |
 | `:nightly` | `ghcr.io/music-assistant/server:nightly` | Current `main` on the upstream nightly server. **Untested.** |
-| `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. `:edge-20260925-a1b2c3d-1234567890`) | Same as `<tag>` | One companion tag per build (build date, commit short SHA, workflow run id), for rolling back to that build. |
+| `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. `:edge-20260925-a1b2c3d-1234567890`) | Same as `<tag>` | One companion tag per build (build date, commit short SHA, workflow run id), for rolling back to that build. A re-run of a workflow adds `-<attempt>`, such as `-2`. |
 
 > [!NOTE]
 > The image was previously published as `ghcr.io/sproft/music-assistant-ytmusic`. That name is retired. Its existing tags stay pullable, so running deployments keep working. New builds are published only as `ghcr.io/sproft/ytmusic-free-provider`, so switch your compose file when convenient.
 >
-> For reproducible deployments, pin to a `@sha256:` digest. It is the only pin that can never change. `:<version>` and the companion tags are stable in normal use, but re-running a build job publishes a fresh image under the same tag, built on whatever base image is current at that moment.
+> For reproducible deployments, pin to a `@sha256:` digest. It is the only pin that can never change. Companion tags are not reused by re-runs. `:<version>` is stable in normal use, but re-running a release's image build publishes a fresh image under the same tag, built on whatever base image is current at that moment.
 
 ## Installation: Home Assistant OS
 

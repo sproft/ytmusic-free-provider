@@ -46,6 +46,12 @@ jobs:
           # arrays, substring expansion) and runs under the GitHub runner's
           # bash, not under dash.
           shellcheck -s bash .github/scripts/evaluate_build_matrix.sh
+          shellcheck -s bash tests/test_evaluate_build_matrix.sh
+
+      - name: Run Docker build-matrix tests (bash)
+        # The decision script behind docker-publish.yml, with docker and git
+        # stubbed. Uses the runner's jq and python3.
+        run: bash tests/test_evaluate_build_matrix.sh
 
       - name: Run installer test suite (POSIX sh, dash)
         run: |
