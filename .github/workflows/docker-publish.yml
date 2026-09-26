@@ -13,8 +13,11 @@ name: Build and Publish Docker Images
 #   :edge    -> base image ghcr.io/music-assistant/server:latest  (stable 2.X releases)
 #   :beta    -> base image ghcr.io/music-assistant/server:beta    (2.X.0b*/rc pre-releases)
 #   :nightly -> base image ghcr.io/music-assistant/server:nightly (2.X.0.dev* builds)
-#   Each also gets an immutable rollback companion tag
-#   `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. :edge-20260831-a1b2c3d-1234567890).
+#   Each also gets a rollback companion tag
+#   `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. :edge-20260831-a1b2c3d-1234567890),
+#   with `-<attempt>` appended when a run is re-run.
+#   A variant whose base image cannot be resolved is skipped; the others
+#   still publish and the `report` job fails the run.
 #
 # The tag separation exists because a change in the upstream base image can
 # break the plugin at any time; only official tag-push releases are tested.
@@ -88,11 +91,15 @@ jobs:
   check:
     name: Decide which variants to build
     runs-on: ubuntu-latest
+    # A handful of registry lookups. The job holds the shared concurrency
+    # group, so a hung lookup must not block the next run for six hours.
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
       matrix: ${{ steps.decision.outputs.matrix }}
       has_builds: ${{ steps.decision.outputs.has_builds }}
+      unresolved: ${{ steps.decision.outputs.unresolved }}
     steps:
       - name: Checkout repository
         # Full history: the check script resolves the last commit that touched
@@ -111,6 +118,7 @@ jobs:
           GIT_REF_TYPE: ${{ github.ref_type }}
           RELEASE_TAG: ${{ inputs.release_tag || '' }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           FORCE_BUILD: ${{ inputs.force_build || 'false' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           REGISTRY: ${{ env.REGISTRY }}
@@ -201,5 +209,25 @@ jobs:
           # descriptors so the next scheduled run can read them via
           # `docker buildx imagetools inspect --raw` (see the step above).
           annotations: ${{ steps.img.outputs.annotations }}
-          cache-from: type=gha,scope=${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+          # No build cache. The only layers this Dockerfile adds are a COPY
+          # and a small RUN on top of the base, and a build only runs once
+          # the base or the provider changed, so a cache would never hit.
+          # Exporting one cost over a minute per leg.
+
+  report:
+    # The check job skips a variant whose base image it cannot resolve so the
+    # others still publish. This job makes that visible: it fails the run
+    # (and sends the usual failure notification) after the builds finished.
+    name: Report unresolved base images
+    needs: [check, build]
+    if: always() && needs.check.result == 'success' && needs.check.outputs.unresolved != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail on unresolved base images
+        env:
+          UNRESOLVED: ${{ needs.check.outputs.unresolved }}
+        run: |
+          echo "::error::Base image lookup failed for: ${UNRESOLVED}. Those variants were not rebuilt; the next scheduled run tries again."
+          exit 1
