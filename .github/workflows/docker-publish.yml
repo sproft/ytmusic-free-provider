@@ -15,7 +15,7 @@ name: Build and Publish Docker Images
 #   :nightly -> base image ghcr.io/music-assistant/server:nightly (2.X.0.dev* builds)
 #   Each also gets a rollback companion tag
 #   `:<tag>-YYYYMMDD-<shortsha>-<run_id>` (e.g. :edge-20260831-a1b2c3d-1234567890),
-#   with `-<attempt>` appended when a run is re-run.
+#   with `-<attempt>` appended by the build job when a run is re-run.
 #   A variant whose base image cannot be resolved is skipped; the others
 #   still publish and the `report` job fails the run.
 #
@@ -91,8 +91,8 @@ jobs:
   check:
     name: Decide which variants to build
     runs-on: ubuntu-latest
-    # A handful of registry lookups. The job holds the shared concurrency
-    # group, so a hung lookup must not block the next run for six hours.
+    # A handful of registry lookups, each capped by the script at 60 s. This
+    # is the backstop so a stuck job cannot hold the run for six hours.
     timeout-minutes: 10
     permissions:
       contents: read
@@ -118,7 +118,6 @@ jobs:
           GIT_REF_TYPE: ${{ github.ref_type }}
           RELEASE_TAG: ${{ inputs.release_tag || '' }}
           RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
           FORCE_BUILD: ${{ inputs.force_build || 'false' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           REGISTRY: ${{ env.REGISTRY }}
@@ -161,15 +160,36 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract Docker metadata (for immutable tags)
+      # matrix.tags holds the moving tags from the check job ("2.1.0\nlatest"
+      # for releases, "edge" for automatic builds). matrix.companion holds the
+      # rollback tag of an automatic build and is empty for releases. The
+      # attempt number is added here and not in the check job, because a
+      # partial re-run reuses the check job's outputs from the first attempt
+      # while GITHUB_RUN_ATTEMPT in this job is always the current one.
+      - name: Resolve tags
+        id: tags
+        env:
+          TAGS: ${{ matrix.tags }}
+          COMPANION: ${{ matrix.companion }}
+        run: |
+          if [ -n "$COMPANION" ] && [ "$GITHUB_RUN_ATTEMPT" != "1" ]; then
+            COMPANION="${COMPANION}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          {
+            echo "tags<<TAGS_EOF"
+            printf '%s\n' "$TAGS"
+            if [ -n "$COMPANION" ]; then
+              printf '%s\n' "$COMPANION"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # matrix.tags is a newline-separated list of raw tags produced by
-          # the check job (e.g. "2.1.0\nlatest" for releases or
-          # "edge\nedge-YYYYMMDD-<shortsha>-<run_id>" for automatic builds).
-          tags: ${{ matrix.tags }}
+          tags: ${{ steps.tags.outputs.tags }}
 
       # Buildx accepts index/manifest-descriptor annotations only on a
       # multi-platform push; every leg of this workflow pushes, so they are
@@ -209,18 +229,21 @@ jobs:
           # descriptors so the next scheduled run can read them via
           # `docker buildx imagetools inspect --raw` (see the step above).
           annotations: ${{ steps.img.outputs.annotations }}
-          # No build cache. The only layers this Dockerfile adds are a COPY
-          # and a small RUN on top of the base, and a build only runs once
-          # the base or the provider changed, so a cache would never hit.
-          # Exporting one cost over a minute per leg.
+          # No build cache. Nearly every build follows a base or provider
+          # change, where the cache cannot hit. The rare rebuild with
+          # unchanged inputs (a workflow-only push, force_build, a re-run)
+          # would only save a COPY and a small RUN, less than the export cost
+          # (up to two minutes per leg).
 
   report:
     # The check job skips a variant whose base image it cannot resolve so the
     # others still publish. This job makes that visible: it fails the run
     # (and sends the usual failure notification) after the builds finished.
+    # !cancelled() instead of always(), so a manually cancelled run does not
+    # also report a failure.
     name: Report unresolved base images
     needs: [check, build]
-    if: always() && needs.check.result == 'success' && needs.check.outputs.unresolved != ''
+    if: ${{ !cancelled() && needs.check.result == 'success' && needs.check.outputs.unresolved != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -229,5 +252,8 @@ jobs:
         env:
           UNRESOLVED: ${{ needs.check.outputs.unresolved }}
         run: |
-          echo "::error::Base image lookup failed for: ${UNRESOLVED}. Those variants were not rebuilt; the next scheduled run tries again."
+          # Re-running this run cannot help: "Re-run failed jobs" reuses the
+          # check job's result, and "Re-run all jobs" rebuilds this run's
+          # commit, which may be older than main by now.
+          echo "::error::Base image lookup failed for: ${UNRESOLVED}. Those variants were not rebuilt. The next scheduled run tries again. To retry sooner, start this workflow manually on main."
           exit 1

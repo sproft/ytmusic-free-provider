@@ -7,8 +7,10 @@
 # The script decides which Docker variants docker-publish.yml builds. It talks
 # to the registry through `docker buildx imagetools inspect` and to the repo
 # through `git log`, so both are replaced by stubs that answer from files in a
-# per-case directory. jq is the real one from PATH, and python3 reads the
-# results back. bash is required because the script under test is bash.
+# per-case directory. `date` is stubbed too, so companion tags do not change
+# if the suite runs across midnight UTC. jq is the real one from PATH, and
+# python3 reads the results back. bash is required because the script under
+# test is bash.
 
 set -u
 
@@ -51,6 +53,7 @@ mkdir -p "$STUBS"
 #   digest/<key>       printed for --format '{{.Manifest.Digest}}'
 #   digest/<key>.fail  exit 1 (registry error, missing tag)
 #   digest/<key>.junk  printed on stdout, then exit 1
+#   digest/<key>.hang  sleep far past the script's lookup timeout
 #   raw/<key>          printed for --raw (published image manifest)
 # A missing file means "not found" (exit 1).
 
@@ -70,6 +73,7 @@ done
 f="$CASE_DIR/$mode/$(printf '%s' "$1" | tr '/:' '__')"
 if [ -f "$f.fail" ]; then echo "ERROR: registry error" >&2; exit 1; fi
 if [ -f "$f.junk" ]; then cat "$f.junk"; exit 1; fi
+if [ -f "$f.hang" ]; then exec sleep 30; fi
 if [ -f "$f" ]; then cat "$f"; exit 0; fi
 echo "ERROR: $1: not found" >&2
 exit 1
@@ -82,7 +86,12 @@ printf 'git %s\n' "$*" >> "$CASE_DIR/calls.log"
 cat "$CASE_DIR/git_head"
 STUB
 
-chmod +x "$STUBS/docker" "$STUBS/git"
+cat > "$STUBS/date" <<'STUB'
+#!/usr/bin/env bash
+echo 20260925
+STUB
+
+chmod +x "$STUBS/docker" "$STUBS/git" "$STUBS/date"
 
 # --- Fixtures -----------------------------------------------------------------
 
@@ -95,7 +104,7 @@ D_NIGHTLY="sha256:$(printf 'c%.0s' {1..64})"
 D_NEW="sha256:$(printf 'd%.0s' {1..64})"
 BASE=ghcr.io/music-assistant/server
 PUBLISHED=ghcr.io/owner/repo-name
-TODAY="$(date -u +%Y%m%d)"
+TODAY=20260925
 KD=org.opencontainers.image.base.digest
 KR=org.opencontainers.image.revision
 
@@ -116,6 +125,7 @@ new_case() {
 set_base()  { printf '%s\n' "$2" > "$CASE_DIR/digest/$(key "$BASE:$1")"; }
 fail_base() { rm -f "$CASE_DIR/digest/$(key "$BASE:$1")"; : > "$CASE_DIR/digest/$(key "$BASE:$1").fail"; }
 junk_base() { rm -f "$CASE_DIR/digest/$(key "$BASE:$1")"; printf '%s\n' "$2" > "$CASE_DIR/digest/$(key "$BASE:$1").junk"; }
+hang_base() { mv "$CASE_DIR/digest/$(key "$BASE:$1")" "$CASE_DIR/digest/$(key "$BASE:$1").hang"; }
 
 # publish <variant> <base digest> <revision> [index|descriptor]
 # Writes the manifest a previous build left behind, with the annotations on
@@ -144,32 +154,42 @@ publish_all_current() {
 
 # run [VAR=value ...]: runs the script with schedule defaults, overridable.
 # Sets RC, and RESULT to "has_builds=... variants=... tags=... unresolved=..."
-# where tags lists each leg's tags joined by '|' and legs by ';'.
+# where tags lists each leg's tags plus its companion tag joined by '|', and
+# legs by ';'. DETAILS holds "ma=<ma_version per leg> rev=<revision per leg>".
 run() {
     OUT="$CASE_DIR/github_output"
     : > "$OUT"
     env -i PATH="$STUBS:$PATH" HOME="$SANDBOX" CASE_DIR="$CASE_DIR" GITHUB_OUTPUT="$OUT" \
         EVENT=schedule SHA="$TRIGGER_SHA" GIT_REF=refs/heads/main GIT_REF_TYPE=branch \
-        RELEASE_TAG= RUN_ID=987654321 RUN_ATTEMPT=1 FORCE_BUILD=false \
+        RELEASE_TAG= RUN_ID=987654321 FORCE_BUILD=false \
         REGISTRY=ghcr.io GITHUB_REPOSITORY=Owner/Repo-Name \
         BASE_IMAGE_LATEST="$BASE:latest" BASE_IMAGE_BETA="$BASE:beta" BASE_IMAGE_DEV="$BASE:nightly" \
         ANNOTATION_BASE_DIGEST="$KD" ANNOTATION_REVISION="$KR" \
         "$@" bash "$SCRIPT" > "$CASE_DIR/stdout" 2> "$CASE_DIR/stderr"
     RC=$?
-    RESULT="$(python3 - "$OUT" <<'PY'
+    python3 - "$OUT" "$CASE_DIR/result" "$CASE_DIR/details" <<'PY'
 import json, sys
+out, result, details = sys.argv[1:]
 kv = {}
-for line in open(sys.argv[1]):
+for line in open(out):
     k, _, v = line.rstrip("\n").partition("=")
     kv[k] = v
 legs = json.loads(kv["matrix"])["include"] if "matrix" in kv else []
-print("has_builds=%s variants=%s tags=%s unresolved=%s" % (
-    kv.get("has_builds", "<unset>"),
-    ",".join(l["variant"] for l in legs) or "-",
-    ";".join(l["tags"].replace("\n", "|") for l in legs) or "-",
-    kv.get("unresolved", "<unset>") or "-"))
+def tags(leg):
+    return "|".join(leg["tags"].split("\n") + ([leg["companion"]] if leg["companion"] else []))
+with open(result, "w") as fh:
+    fh.write("has_builds=%s variants=%s tags=%s unresolved=%s" % (
+        kv.get("has_builds", "<unset>"),
+        ",".join(l["variant"] for l in legs) or "-",
+        ";".join(tags(l) for l in legs) or "-",
+        kv.get("unresolved", "<unset>") or "-"))
+with open(details, "w") as fh:
+    fh.write("ma=%s rev=%s" % (
+        ",".join(l["ma_version"] for l in legs) or "-",
+        ",".join(sorted(set(l["revision"] for l in legs))) or "-"))
 PY
-)"
+    RESULT="$(cat "$CASE_DIR/result")"
+    DETAILS="$(cat "$CASE_DIR/details")"
 }
 
 leg() { printf '%s|%s-%s-abcdef0-987654321' "$1" "$1" "$TODAY"; }
@@ -181,11 +201,15 @@ new_case s1 "schedule, nothing published yet"
 run
 assert_eq "exit status" 0 "$RC"
 assert_eq "builds all three" "has_builds=true variants=edge,beta,nightly tags=$E;$B;$N unresolved=-" "$RESULT"
+assert_eq "base channel and revision per leg" "ma=latest,beta,nightly rev=$HEAD_SHA" "$DETAILS"
+assert_eq "revision comes from the build inputs only" 1 \
+    "$(grep -c '^git log -1 --format=%H -- ytmusic_free Dockerfile .dockerignore$' "$CASE_DIR/calls.log")"
 
 new_case s2 "schedule, everything current (index annotations)"
 publish_all_current
 run
 assert_eq "builds nothing" "has_builds=false variants=- tags=- unresolved=-" "$RESULT"
+assert_eq "reads each published image" 3 "$(grep -c 'inspect --raw' "$CASE_DIR/calls.log")"
 
 new_case s3 "schedule, everything current (annotations only on descriptors)"
 publish edge "$D_LATEST" "$HEAD_SHA" descriptor
@@ -237,15 +261,16 @@ assert_eq "exit status" 0 "$RC"
 assert_eq "builds nothing" "has_builds=false variants=- tags=- unresolved=<unset>" "$RESULT"
 assert_eq "never touches the registry" 0 "$(grep -c '^docker' "$CASE_DIR/calls.log")"
 
-new_case w1 "workflow_call without release_tag"
-run EVENT=workflow_call
+new_case w1 "any other event (pull_request)"
+run EVENT=pull_request
 assert_eq "builds nothing" "has_builds=false variants=- tags=- unresolved=-" "$RESULT"
 
 # --- Releases -------------------------------------------------------------------
 
 new_case r1 "release v1.2.3 via release.yml (caller event is the tag push)"
 run EVENT=push GIT_REF=refs/tags/v1.2.3 GIT_REF_TYPE=tag RELEASE_TAG=v1.2.3
-assert_eq "publishes version and latest" "has_builds=true variants=release tags=1.2.3|latest unresolved=<unset>" "$RESULT"
+assert_eq "publishes version and latest, no companion" "has_builds=true variants=release tags=1.2.3|latest unresolved=<unset>" "$RESULT"
+assert_eq "builds on the stable base" "ma=latest rev=$HEAD_SHA" "$DETAILS"
 assert_eq "never reads published images" 0 "$(grep -c 'inspect --raw' "$CASE_DIR/calls.log")"
 
 new_case r2 "prerelease v1.2.3-rc.1"
@@ -296,20 +321,26 @@ set_base latest "<html>502</html>"
 run EVENT=push
 assert_eq "treated as unresolved" "has_builds=true variants=beta,nightly tags=$B;$N unresolved=edge" "$RESULT"
 
+new_case u6 "lookup of the upstream beta image hangs"
+hang_base beta
+run EVENT=push LOOKUP_TIMEOUT=2
+assert_eq "exit status" 0 "$RC"
+assert_eq "times out and skips only beta" "has_builds=true variants=edge,nightly tags=$E;$N unresolved=beta" "$RESULT"
+
 # --- Companion tags and output format -------------------------------------------
 
-new_case c1 "re-run (attempt 2)"
-run EVENT=push RUN_ATTEMPT=2
-assert_eq "suffix gets the attempt" "edge|edge-$TODAY-abcdef0-987654321-2" "$(printf '%s' "$RESULT" | sed 's/.*tags=\([^;]*\);.*/\1/')"
-
-new_case c2 "no run id (local run)"
-run EVENT=push RUN_ID= RUN_ATTEMPT=3
+new_case c1 "no run id (local run)"
+run EVENT=push RUN_ID=
 assert_eq "suffix is date and sha only" "edge|edge-$TODAY-abcdef0" "$(printf '%s' "$RESULT" | sed 's/.*tags=\([^;]*\);.*/\1/')"
 
-new_case o1 "GITHUB_OUTPUT format"
+new_case o1 "GITHUB_OUTPUT format, automatic run"
 run EVENT=push
 assert_eq "one line per output" 3 "$(wc -l < "$OUT" | tr -d ' ')"
-assert_eq "newlines in tags stay escaped" 1 "$(grep -c 'edge\\nedge-' "$OUT")"
+
+new_case o2 "GITHUB_OUTPUT format, release"
+run EVENT=push GIT_REF=refs/tags/v1.2.3 GIT_REF_TYPE=tag RELEASE_TAG=v1.2.3
+assert_eq "one line per output" 2 "$(wc -l < "$OUT" | tr -d ' ')"
+assert_eq "newline between tags stays escaped" 1 "$(grep -c '"tags":"1.2.3\\nlatest"' "$OUT")"
 
 # --- Summary ----------------------------------------------------------------------
 

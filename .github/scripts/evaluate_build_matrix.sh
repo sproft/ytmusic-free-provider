@@ -25,7 +25,7 @@ GIT_REF="${GIT_REF:-}"                              # github.ref
 GIT_REF_TYPE="${GIT_REF_TYPE:-}"                    # github.ref_type
 RELEASE_TAG="${RELEASE_TAG:-}"                      # release_tag workflow_call input (set by release.yml)
 RUN_ID="${RUN_ID:-}"                                # github.run_id, part of the companion tag suffix
-RUN_ATTEMPT="${RUN_ATTEMPT:-1}"                     # github.run_attempt, appended to the suffix on re-runs
+LOOKUP_TIMEOUT="${LOOKUP_TIMEOUT:-60}"              # seconds allowed per registry lookup
 FORCE_BUILD="${FORCE_BUILD:-false}"                 # workflow_dispatch input
 REGISTRY="${REGISTRY:?REGISTRY is required}"
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
@@ -37,16 +37,12 @@ ANNOTATION_REVISION="${ANNOTATION_REVISION:?ANNOTATION_REVISION is required}"
 
 # Companion tag suffix for rollback: <tag>-YYYYMMDD-<shortsha>-<run_id>.
 # The run id keeps the tag unique even for several builds of the same commit
-# on the same day. A re-run keeps the run id, so attempts after the first get
-# -<attempt> appended; otherwise a same-day re-run would push a fresh image
-# under the tag of the first attempt. Empty run id (local testing) leaves both
-# off.
+# on the same day. Empty run id (local testing) leaves it off. The build job
+# appends -<attempt> on re-runs; it has to happen there, because a partial
+# re-run reuses this job's outputs from the first attempt.
 COMPANION_SUFFIX="$(date -u +%Y%m%d)-${SHA::7}"
 if [ -n "$RUN_ID" ]; then
   COMPANION_SUFFIX="${COMPANION_SUFFIX}-${RUN_ID}"
-  if [ "$RUN_ATTEMPT" != "1" ]; then
-    COMPANION_SUFFIX="${COMPANION_SUFFIX}-${RUN_ATTEMPT}"
-  fi
 fi
 
 # Last commit that touched anything the image build consumes. Stamped as the
@@ -58,12 +54,12 @@ LAST_BUILD_COMMIT="$(git log -1 --format=%H -- ytmusic_free Dockerfile .dockerig
 
 # Resolve the real multi-arch index digest (a `sha256:...` digest) of an
 # image tag. Stable across architectures and independent of the local
-# platform. Returns 1 when the lookup fails or prints something that is not a
-# digest. The status is checked explicitly because callers run this inside
-# `if !`, where set -e does not apply.
+# platform. Returns 1 when the lookup fails, hangs past LOOKUP_TIMEOUT or
+# prints something that is not a digest. The status is checked explicitly
+# because get_digest always runs inside $( ), where bash clears set -e.
 get_digest() {
   local digest
-  if ! digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1")"; then
+  if ! digest="$(timeout "$LOOKUP_TIMEOUT" docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1")"; then
     echo "ERROR: could not resolve '$1'" >&2
     return 1
   fi
@@ -82,7 +78,7 @@ get_digest() {
 # or the annotation does not exist yet).
 get_annotations() {
   local image="$1" raw digest revision
-  if raw="$(docker buildx imagetools inspect --raw "$image" 2>/dev/null)"; then
+  if raw="$(timeout "$LOOKUP_TIMEOUT" docker buildx imagetools inspect --raw "$image" 2>/dev/null)"; then
     digest="$(printf '%s' "$raw" | jq -r --arg k "$ANNOTATION_BASE_DIGEST" \
       '.annotations[$k] // empty, (.manifests[]? | .annotations[$k] // empty)' 2>/dev/null | head -n1 || true)"
     revision="$(printf '%s' "$raw" | jq -r --arg k "$ANNOTATION_REVISION" \
@@ -158,6 +154,7 @@ if [ -n "$TAG_NAME" ]; then
       variant: "release",
       ma_version: "latest",
       tags: $tags,
+      companion: "",
       base_digest: $base_digest,
       revision: $revision
     }]
@@ -205,8 +202,8 @@ for variant in edge beta nightly; do
       fi
       ;;
     *)
-      # Any other event reaching this point (a workflow_call without
-      # release_tag) builds nothing.
+      # Any other event (for example a future caller started by
+      # pull_request) builds nothing.
       ;;
   esac
 
@@ -216,13 +213,15 @@ for variant in edge beta nightly; do
     legs="$(printf '%s' "$legs" | jq -c \
       --arg variant "$variant" \
       --arg ma_version "${MA_VERSION[$variant]}" \
-      --arg tags "$(printf '%s\n%s-%s' "$variant" "$variant" "$COMPANION_SUFFIX")" \
+      --arg tags "$variant" \
+      --arg companion "$variant-$COMPANION_SUFFIX" \
       --arg base_digest "$base_digest" \
       --arg revision "$LAST_BUILD_COMMIT" \
       '. + [{
         variant: $variant,
         ma_version: $ma_version,
         tags: $tags,
+        companion: $companion,
         base_digest: $base_digest,
         revision: $revision
       }]')"
