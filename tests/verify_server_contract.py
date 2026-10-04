@@ -29,9 +29,11 @@ import inspect
 
 # Parameters of ``music_assistant.controllers.cache.use_cache`` that the provider
 # passes. It decorates eleven methods, every one of them as
-# ``@use_cache(<int>, allow_expired_cache=True)``, so losing either name is a
+# ``@use_cache(<int>, allow_expired_cache=True)``, and the three long-lived
+# lookups that return tracks also pass ``cache_checksum`` so a parser change can
+# retire their 30-day entries (issue #90). Losing any of these names is a
 # TypeError raised while the class body executes.
-REQUIRED_USE_CACHE_PARAMS = ("expiration", "allow_expired_cache")
+REQUIRED_USE_CACHE_PARAMS = ("expiration", "allow_expired_cache", "cache_checksum")
 
 # Not passed by the provider, and that is exactly why it needs asserting here.
 # ``get_playlist_tracks`` is only correct because Music Assistant bypasses the
