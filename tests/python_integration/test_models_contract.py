@@ -212,6 +212,39 @@ def test_stream_details_still_cannot_express_delayed_availability(real_models):
     )
 
 
+def _image_pair(real_models):
+    image_type = real_models.enums.ImageType
+    image = real_models.media_items.MediaItemImage
+    kwargs = {
+        "path": "https://i.ytimg.com/vi/x/maxresdefault.jpg",
+        "provider": "p",
+        "remotely_accessible": True,
+    }
+    return image(type=image_type.LANDSCAPE, **kwargs), image(type=image_type.THUMB, **kwargs)
+
+
+def test_image_equality_includes_the_type(real_models):
+    """``_parse_thumbnails`` adds a THUMB with the same path as a LANDSCAPE (#90).
+
+    If equality ever dropped the type, UniqueList would deduplicate that THUMB
+    away and players would show the Music Assistant logo again.
+    """
+    landscape, thumb = _image_pair(real_models)
+    assert landscape != thumb
+    assert len(real_models.media_items.UniqueList([landscape, thumb])) == 2
+
+
+def test_media_item_image_only_returns_a_thumb(real_models):
+    """Why the THUMB fallback exists: player artwork ignores LANDSCAPE (#90)."""
+    media_items = real_models.media_items
+    landscape, thumb = _image_pair(real_models)
+    track = media_items.Track(item_id="x", provider="p", name="Mix", provider_mappings=set())
+    track.metadata.images = media_items.UniqueList([landscape])
+    assert track.image is None
+    track.metadata.images = media_items.UniqueList([landscape, thumb])
+    assert track.image == thumb
+
+
 def test_bit_rate_defaults_to_none_so_an_unset_value_is_distinguishable(real_models):
     """The provider only sets bit_rate when yt-dlp reported one.
 

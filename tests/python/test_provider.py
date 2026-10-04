@@ -971,6 +971,160 @@ def test_parse_thumbnails_landscape_for_maxres(provider):
     assert images[0].type == ImageType.LANDSCAPE
 
 
+# Issue #90: Music Assistant only uses THUMB images for player artwork, so every
+# item that has any usable picture must come out with one.
+MAXRES = "https://i.ytimg.com/vi/x/maxresdefault.jpg"
+MAXRES_ONLY_VIDEO = [
+    {"url": "https://i.ytimg.com/vi/x/hqdefault.jpg", "width": 480, "height": 360},
+    {"url": MAXRES, "width": 1280, "height": 720},
+]
+
+
+def test_parse_thumbnails_mirrors_landscape_as_thumb_for_video(provider):
+    # hqdefault is dropped by the width filter, leaving only a LANDSCAPE.
+    images = provider._parse_thumbnails(MAXRES_ONLY_VIDEO)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == images[0].path == MAXRES
+    assert images[1].provider == provider.instance_id
+    assert images[1].remotely_accessible is True
+
+
+def test_parse_thumbnails_no_mirror_when_thumb_exists(provider):
+    thumbs = [
+        {"url": MAXRES, "width": 1280, "height": 720},
+        {"url": "https://example/a=w800-h800", "width": 800, "height": 800},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == "https://example/a=w800-h800"
+
+
+def test_parse_thumbnails_mirrors_once_for_several_landscapes(provider):
+    thumbs = [
+        {"url": MAXRES, "width": 1280, "height": 720},
+        {"url": "https://i.ytimg.com/vi/y/maxresdefault.jpg", "width": 1920, "height": 1080},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    thumbs_out = [img for img in images if img.type == ImageType.THUMB]
+    assert [img.path for img in thumbs_out] == ["https://i.ytimg.com/vi/y/maxresdefault.jpg"]
+
+
+def test_parse_thumbnails_crops_a_wide_size_param_banner_square(provider):
+    # A banner with no entry under 600 px is all LANDSCAPE; the THUMB fallback
+    # asks the image server for a square crop of it.
+    thumbs = [
+        {"url": "https://lh3.googleusercontent.com/a=w1440-h600", "width": 1440, "height": 600},
+        {"url": "https://lh3.googleusercontent.com/a=w2880-h1200-p-l90-rj", "width": 2880, "height": 1200},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == "https://lh3.googleusercontent.com/a=w600-h600-p"
+
+
+def test_parse_thumbnails_no_fallback_when_a_small_size_param_image_became_thumb(provider):
+    # Real artist headers: the 540x225 entry is rewritten to a square THUMB.
+    thumbs = [
+        {"url": "https://lh3.googleusercontent.com/a=w540-h225", "width": 540, "height": 225},
+        {"url": "https://lh3.googleusercontent.com/a=w1440-h600", "width": 1440, "height": 600},
+    ]
+    images = provider._parse_thumbnails(thumbs)
+    assert [img.type for img in images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+    assert images[1].path == "https://lh3.googleusercontent.com/a=w600-h600-p"
+
+
+# Search and playlist rows for video uploads carry a single signed 400x225.
+SMALL_FRAME = "https://i.ytimg.com/vi/x/hqdefault.jpg?sqp=-oaymwE&rs=AOn4CL"
+SMALL_FRAME_ONLY = [{"url": SMALL_FRAME, "width": 400, "height": 225}]
+
+
+def test_parse_thumbnails_keeps_a_small_video_frame_for_a_track(provider):
+    images = provider._parse_thumbnails(SMALL_FRAME_ONLY, keep_small_frame=True)
+    assert [(img.type, img.path) for img in images] == [(ImageType.THUMB, SMALL_FRAME)]
+
+
+def test_parse_thumbnails_drops_a_small_video_frame_by_default(provider):
+    # Playlists: Music Assistant generates a collage when there is no THUMB.
+    assert provider._parse_thumbnails(SMALL_FRAME_ONLY) == []
+
+
+def test_parse_thumbnails_keeps_the_widest_small_video_frame(provider):
+    # yt-dlp flat playlist entries top out at 336x188.
+    thumbs = [
+        {"url": f"https://i.ytimg.com/vi/x/hqdefault.jpg?sqp={w}", "width": w, "height": h}
+        for w, h in ((168, 94), (336, 188), (246, 138), (196, 110))
+    ]
+    images = provider._parse_thumbnails(thumbs, keep_small_frame=True)
+    assert [img.path for img in images] == ["https://i.ytimg.com/vi/x/hqdefault.jpg?sqp=336"]
+    assert images[0].type == ImageType.THUMB
+
+
+@pytest.mark.parametrize(
+    "thumb",
+    [
+        # Channel avatar: artists keep deferring to fanart.tv and TheAudioDB.
+        {"url": "https://yt3.ggpht.com/abc=s88-c-k-c0x00ffffff-no-rj", "width": 88, "height": 88},
+        # No width: the one real case pointed at a deleted video and 404s.
+        {"url": "https://i.ytimg.com/vi/gone/mqdefault.jpg"},
+    ],
+    ids=["channel-avatar", "no-width"],
+)
+def test_parse_thumbnails_keep_small_frame_ignores_non_frames(provider, thumb):
+    assert provider._parse_thumbnails([thumb], keep_small_frame=True) == []
+
+
+def test_parse_track_keeps_a_small_video_frame(provider):
+    track = provider._parse_track(
+        {
+            "videoId": "x",
+            "title": "Mix",
+            "artists": [{"name": "Uploader", "id": "UCx"}],
+            "thumbnails": SMALL_FRAME_ONLY,
+        }
+    )
+    assert [img.path for img in track.metadata.images] == [SMALL_FRAME]
+
+
+def test_parse_playlist_leaves_a_frame_only_playlist_to_the_collage(provider):
+    playlist = provider._parse_playlist(
+        {"playlistId": "PLx", "title": "P", "thumbnails": SMALL_FRAME_ONLY}
+    )
+    assert not playlist.metadata.images
+
+
+def test_parse_album_keeps_the_mirrored_thumb_through_unique_list(provider):
+    album = provider._parse_album(
+        {"browseId": "MPREb_x", "title": "A", "artists": [], "thumbnails": MAXRES_ONLY_VIDEO}
+    )
+    assert [img.type for img in album.metadata.images] == [ImageType.LANDSCAPE, ImageType.THUMB]
+
+
+@pytest.mark.parametrize(
+    "thumbnails",
+    [
+        MAXRES_ONLY_VIDEO,
+        [{"url": "https://i.ytimg.com/vi/x/hqdefault.jpg?sqp=a", "width": 320, "height": 180}],
+    ],
+    ids=["maxresdefault-only", "small-frame-only"],
+)
+def test_get_track_video_upload_carries_a_thumb(provider, thumbnails):
+    """End to end through get_track's videoDetails normalisation (#90)."""
+    mock = MagicMock()
+    mock.get_song = MagicMock(
+        return_value={
+            "videoDetails": {
+                "videoId": "x",
+                "title": "Mix",
+                "lengthSeconds": "3600",
+                "author": "Uploader",
+                "thumbnail": {"thumbnails": thumbnails},
+            }
+        }
+    )
+    provider._ytmusic = mock
+    track = asyncio.run(provider.get_track("x"))
+    assert any(img.type == ImageType.THUMB for img in track.metadata.images)
+
+
 def test_parse_thumbnails_skips_empty_url(provider):
     thumbs = [{"url": "", "width": 800, "height": 800}]
     images = provider._parse_thumbnails(thumbs)
@@ -3548,6 +3702,33 @@ def test_metadata_lookups_are_cached(method, ttl_attr):
     assert args is not None, f"{method} is not cached"
     assert args["expiration"] == getattr(ytm, ttl_attr)
     assert args.get("allow_expired_cache") is True
+
+
+@pytest.mark.parametrize("method", ["get_track", "get_album_tracks", "get_artist_toptracks"])
+def test_track_caches_carry_the_parser_version(method):
+    """Tracks written by an older parser become misses after an update.
+
+    These entries last up to 30 days and Music Assistant serves expired ones
+    once more before refreshing, so a parser fix such as the THUMB fallback
+    for video uploads (issue #90) took a month to arrive without a checksum.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    args = getattr(YoutubeMusicFreeProvider, method).__ma_cache__
+    assert args.get("cache_checksum") == ytm.TRACK_CACHE_VERSION
+
+
+@pytest.mark.parametrize("method", ["get_album", "get_artist", "get_artist_albums"])
+def test_album_and_artist_caches_survive_a_track_parser_bump(method):
+    """The album-year lookup runs get_album up to 40 times per page (#53).
+
+    A checksum there would send every user's lookups to YouTube cold after
+    each release that only changed how tracks are parsed.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    args = getattr(YoutubeMusicFreeProvider, method).__ma_cache__
+    assert "cache_checksum" not in args
 
 
 def test_similar_tracks_cache_is_shorter_than_the_catalog_one():

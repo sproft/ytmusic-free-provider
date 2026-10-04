@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 
 import asyncio
 import importlib
@@ -190,6 +190,16 @@ PLAYLIST_TRACKS_CACHE_TTL = 3 * 3600
 # raised in issue #53. Same figures the official ytmusic provider uses.
 CATALOG_CACHE_TTL = 30 * 24 * 3600
 ARTIST_CACHE_TTL = 7 * 24 * 3600
+
+# Stored as the cache checksum on the long-lived lookups that return tracks
+# (get_track, get_album_tracks, get_artist_toptracks). Music Assistant treats an
+# entry whose checksum differs as a miss, so bumping this when a change to
+# _parse_track alters what tracks contain retires each old entry on its next
+# lookup, well before its 30 days run out. Albums and artists are left alone so
+# the album-year lookups keep their warm cache; the short-lived caches turn
+# over on their own.
+# 2: THUMB fallback for video uploads (issue #90).
+TRACK_CACHE_VERSION = "2"
 
 # Song radio is meant to differ each time it is asked for, so it gets a short
 # window: long enough that paging through a queue is stable, short enough that
@@ -1637,7 +1647,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 )
         return results
 
-    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id.
 
@@ -1699,7 +1709,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             raise MediaNotFoundError(f"Album {prov_album_id} not found")
         return self._parse_album(album_obj, prov_album_id)
 
-    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get album tracks for given album id."""
         album_obj = await asyncio.to_thread(self._ytmusic.get_album, prov_album_id)
@@ -1801,7 +1811,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 albums.append(self._parse_album(album_obj, album_obj.get("browseId")))
         return albums
 
-    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
+    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get a list of most popular tracks for the given artist."""
         artist_obj = await self._fetch_artist_obj(prov_artist_id)
@@ -3370,7 +3380,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
             raise InvalidDataError("Track is missing artists")
 
         if track_obj.get("thumbnails"):
-            track.metadata.images = self._parse_thumbnails(track_obj["thumbnails"])
+            track.metadata.images = self._parse_thumbnails(
+                track_obj["thumbnails"], keep_small_frame=True
+            )
         album = track_obj.get("album")
         if isinstance(album, dict) and album.get("id"):
             track.album = self._get_item_mapping(MediaType.ALBUM, album["id"], album.get("name", ""))
@@ -3595,10 +3607,18 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # inventing one from a field YouTube does not give us anonymously.
         return episode
 
-    def _parse_thumbnails(self, thumbnails_obj: list[dict]) -> list[MediaItemImage]:
-        """Convert YTM thumbnail list to MediaItemImage list."""
+    def _parse_thumbnails(
+        self, thumbnails_obj: list[dict], *, keep_small_frame: bool = False
+    ) -> list[MediaItemImage]:
+        """Convert YTM thumbnail list to MediaItemImage list.
+
+        ``keep_small_frame`` is for tracks only: a playlist without a THUMB gets
+        a generated collage from Music Assistant, which beats a 400 px frame.
+        """
         result: list[MediaItemImage] = []
         processed = set()
+        # Widest video frame the size filter below drops (sorted widest first).
+        small_frame: str | None = None
         for img in sorted(thumbnails_obj, key=lambda w: w.get("width", 0), reverse=True):
             url: str = img.get("url", "")
             if not url:
@@ -3613,6 +3633,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 else ImageType.THUMB
             )
             if "=w" not in url and width < 500:
+                if small_frame is None and width and "ytimg.com/vi" in url:
+                    small_frame = url
                 continue
             if "=w" in url and width < 600:
                 url = f"{url_base}=w600-h600-p"
@@ -3628,6 +3650,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     remotely_accessible=True,
                 )
             )
+        # Music Assistant only takes THUMB images for queue items and player
+        # artwork, and sends its logo to Cast and every other player without
+        # one. Video uploads can end up with none: a 16:9 maxresdefault is typed
+        # LANDSCAPE, and search and playlist rows carry a single 400x225 frame
+        # the filter above drops. Fall back to the widest kept image, or for a
+        # track to the widest dropped video frame (issue #90).
+        if not any(img.type == ImageType.THUMB for img in result):
+            fallback = result[0].path if result else None
+            if fallback is None and keep_small_frame:
+                fallback = small_frame
+            if fallback and "=w" in fallback:
+                # Size-param URLs crop to a square server-side, as above.
+                fallback = f"{fallback.split('=w')[0]}=w600-h600-p"
+            if fallback:
+                result.append(
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=fallback,
+                        provider=self.instance_id,
+                        remotely_accessible=True,
+                    )
+                )
         return result
 
     def _get_item_mapping(
