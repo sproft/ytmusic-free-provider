@@ -252,3 +252,37 @@ def test_bit_rate_defaults_to_none_so_an_unset_value_is_distinguishable(real_mod
     would make every stream claim a bitrate it never measured.
     """
     assert real_models.media_items.AudioFormat().bit_rate is None
+
+
+def test_event_type_has_the_members_the_provider_signals(real_models):
+    event_type = real_models.enums.EventType
+    missing = [
+        name for name in ma_contract.REQUIRED_EVENT_TYPE_MEMBERS if not hasattr(event_type, name)
+    ]
+    assert not missing, f"upstream EventType lost members the provider signals: {missing}"
+
+
+def test_provider_error_carries_the_fields_the_auth_notice_uses(real_models):
+    """The auth notice (issue #92) is a ProviderError written as last_error."""
+    provider_error = real_models.config_entries.ProviderError
+    fields = {f.name for f in dataclasses.fields(provider_error)}
+    missing = set(ma_contract.REQUIRED_PROVIDER_ERROR_FIELDS) - fields
+    assert not missing, f"upstream ProviderError lost fields: {missing}"
+
+
+def test_provider_error_keeps_a_custom_message_without_a_translation_key(real_models):
+    """With no key set, serialising must leave the provider's own text alone.
+
+    A translation key would swap the notice for Music Assistant's generic
+    "Login failed" string, which says nothing about anonymous mode or the fix.
+    """
+    error = real_models.config_entries.ProviderError(
+        error_code=ma_contract.LOGIN_FAILED_ERROR_CODE, message="custom notice"
+    )
+    assert error.translation_key is None
+    assert error.to_dict()["message"] == "custom notice"
+
+
+def test_login_failed_code_is_unchanged(real_models):
+    """The server maps this code to the "Authentication required" status."""
+    assert real_models.errors.LoginFailed.error_code == ma_contract.LOGIN_FAILED_ERROR_CODE

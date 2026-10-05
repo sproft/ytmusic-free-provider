@@ -74,7 +74,62 @@ def main() -> None:
 
     print(f"use_cache signature ok: {', '.join(params)}")
     print(f"BYPASS_CACHE ok: {BYPASS_CACHE!r}")
+
+    check_auth_notice_contract()
     print("server contract ok")
+
+
+def check_auth_notice_contract() -> None:
+    """Check the server pieces the cookie auth notice stands on (issue #92).
+
+    The provider guards every one of these with getattr, so losing one does not
+    break loading. It silently brings back the failure the notice exists to
+    end: cookie auth falls over and nothing in the UI says so. Hence a check
+    here rather than a crash there.
+    """
+    from music_assistant_models.config_entries import ProviderConfig, ProviderError
+    from music_assistant_models.enums import ProviderStatus, ProviderType
+    from music_assistant_models.errors import LoginFailed
+
+    from music_assistant.controllers.config import ConfigController
+    from music_assistant.models.provider import Provider
+
+    if not callable(getattr(ConfigController, "update_provider_last_error", None)):
+        raise SystemExit(
+            "ConfigController.update_provider_last_error is gone; the cookie auth "
+            "notice can no longer be shown. See issue #92."
+        )
+    for hook in ("loaded_in_mass", "unload"):
+        if not callable(getattr(Provider, hook, None)):
+            raise SystemExit(f"Provider base lost {hook}(); the auth notice relies on it.")
+    if "is_removed" not in inspect.signature(Provider.unload).parameters:
+        raise SystemExit("Provider.unload lost its is_removed parameter.")
+    # ``initialized`` is assigned in __init__, so it is checked in the source
+    # rather than on the class.
+    if "self.initialized" not in inspect.getsource(Provider.__init__):
+        raise SystemExit("Provider base no longer sets self.initialized.")
+
+    # The badge the notice is meant to carry. _provider_status is private, so a
+    # rename only skips this part; a changed mapping fails it.
+    try:
+        from music_assistant.controllers.config.helpers import _provider_status
+    except ImportError:
+        print("auth notice: _provider_status not found, status mapping not checked")
+    else:
+        conf = ProviderConfig(
+            values={},
+            type=ProviderType.MUSIC,
+            domain="ytmusic_free",
+            instance_id="ytmusic_free--contract",
+            last_error=ProviderError(error_code=LoginFailed.error_code, message="notice"),
+        )
+        status = _provider_status(conf, True)
+        if status != ProviderStatus.AUTH_REQUIRED:
+            raise SystemExit(
+                f"a loaded provider with a LoginFailed last_error now reads {status}, "
+                "not AUTH_REQUIRED; revisit the error code in _sync_auth_notice."
+            )
+    print("auth notice contract ok")
 
 
 if __name__ == "__main__":

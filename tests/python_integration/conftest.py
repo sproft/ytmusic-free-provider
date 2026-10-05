@@ -67,6 +67,8 @@ def real_models():
             enums = importlib.import_module(f"{_STUBBED_PACKAGE}.enums")
             media_items = importlib.import_module(f"{_STUBBED_PACKAGE}.media_items")
             streamdetails = importlib.import_module(f"{_STUBBED_PACKAGE}.streamdetails")
+            config_entries = importlib.import_module(f"{_STUBBED_PACKAGE}.config_entries")
+            errors = importlib.import_module(f"{_STUBBED_PACKAGE}.errors")
         except ImportError as err:
             message = f"{_STUBBED_PACKAGE} is not installed: {err}"
             if REQUIRE_REAL_MODELS:
@@ -84,7 +86,11 @@ def real_models():
             )
 
         yield SimpleNamespace(
-            enums=enums, media_items=media_items, streamdetails=streamdetails
+            enums=enums,
+            media_items=media_items,
+            streamdetails=streamdetails,
+            config_entries=config_entries,
+            errors=errors,
         )
     finally:
         for name in list(_installed_submodules()):
