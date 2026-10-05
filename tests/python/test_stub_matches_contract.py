@@ -29,7 +29,9 @@ from pathlib import Path
 import pytest
 
 # Imports below are resolved against the stubs registered in conftest.py.
-from music_assistant_models.enums import ContentType, MediaType, StreamType
+from music_assistant_models.config_entries import ProviderError
+from music_assistant_models.enums import ContentType, EventType, MediaType, StreamType
+from music_assistant_models.errors import LoginFailed, SetupFailedError
 
 # Imported from media_items, not streamdetails, because that is the path the
 # provider itself uses. Upstream re-exports the same class from both.
@@ -233,3 +235,28 @@ def test_stub_stream_details_does_not_invent_a_delayed_availability_field():
     assert not present, (
         f"stub StreamDetails invented {present}, which upstream does not have"
     )
+
+
+def test_stub_event_type_has_the_required_members():
+    missing = [
+        name for name in ma_contract.REQUIRED_EVENT_TYPE_MEMBERS if not hasattr(EventType, name)
+    ]
+    assert not missing, f"stub EventType is missing {missing}; see tests/ma_contract.py"
+
+
+def test_stub_provider_error_has_the_required_fields():
+    fields = {f.name for f in dataclasses.fields(ProviderError)}
+    missing = set(ma_contract.REQUIRED_PROVIDER_ERROR_FIELDS) - fields
+    assert not missing, f"stub ProviderError is missing {missing}"
+
+
+def test_stub_provider_error_leaves_the_translation_key_unset():
+    assert ProviderError(error_code=1, message="x").translation_key is None
+
+
+def test_stub_login_failed_code_matches():
+    assert LoginFailed.error_code == ma_contract.LOGIN_FAILED_ERROR_CODE
+
+
+def test_stub_setup_failed_code_matches():
+    assert SetupFailedError.error_code == ma_contract.SETUP_FAILED_ERROR_CODE

@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.1.5"
+__version__ = "1.2.0"
 
 import asyncio
 import importlib
@@ -43,16 +43,27 @@ from music_assistant_models.enums import (
     AlbumType,
     ConfigEntryType,
     ContentType,
+    EventType,
     ImageType,
     ProviderFeature,
     StreamType,
 )
 from music_assistant_models.errors import (
     InvalidDataError,
+    LoginFailed,
     MediaNotFoundError,
     SetupFailedError,
     UnplayableMediaError,
 )
+
+try:
+    # The structured provider error behind the auth notice. Music Assistant 2.9
+    # stored last_error as a plain string and has neither this class nor
+    # update_provider_last_error, so there the notice is skipped and the log
+    # warning is all the user gets.
+    from music_assistant_models.config_entries import ProviderError
+except ImportError:  # pragma: no cover - Music Assistant 2.9.x
+    ProviderError = None
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -386,12 +397,54 @@ AUTH_LAPSE_ERROR_PATTERN = re.compile(
     r"|\bHTTP\s+401\b"
     r"|\bUnauthorized\b"
     r"|\bnot\s+authenticated\b"
-    r"|\bauthentication\s+(?:failed|required)\b"
+    # Not after "Proxy ": an HTTP proxy's 407 "Proxy Authentication Required"
+    # is about the proxy's own credentials, and the cookie is fine.
+    r"|\b(?<!proxy\s)authentication\s+(?:failed|required)\b"
     # ytmusicapi's own wording when the client has no credentials at all
     # (YTMusic._check_auth raises YTMusicUserError with exactly this text).
     r"|\bprovide\s+authentication\b)",
     re.IGNORECASE,
 )
+
+# The notice shown in the Music Assistant UI while cookie authentication is
+# configured but not working (issue #92). Before it, the only sign was a warning
+# in the log: search and playback kept working, so nothing looked wrong while
+# library sync had stopped. Music Assistant renders it as the provider's error,
+# with an "Authentication required" badge in the provider list and the text as
+# Markdown on the provider's settings page.
+AUTH_NOTICE_COOKIE_FAILED = (
+    "Cookie authentication failed, so this provider is running in anonymous "
+    "mode. Search and playback still work, but library sync and recommendations "
+    "are off. Copy a fresh Cookie header from a signed-in music.youtube.com tab "
+    "into the Cookie header field of this provider's settings and save. "
+    "Error: `{reason}`"
+)
+AUTH_NOTICE_COOKIE_UNVERIFIED = (
+    "The cookie could not be checked at startup, so this provider is running in "
+    "anonymous mode. Search and playback still work, but library sync and "
+    "recommendations are off. The error does not point at the cookie, so reload "
+    "this provider once music.youtube.com is reachable again. Error: `{reason}`"
+)
+AUTH_NOTICE_COOKIE_MISSING = (
+    "Cookie authentication is selected but the Cookie header field is empty, so "
+    "this provider is running in anonymous mode. Search and playback still work, "
+    "but library sync and recommendations are off. Paste the Cookie header from a "
+    "signed-in music.youtube.com tab and save, or set Authentication to "
+    "None (anonymous)."
+)
+AUTH_NOTICE_COOKIE_LAPSED = (
+    "YouTube stopped accepting the cookie while this provider was running, so "
+    "library sync is failing. Copy a fresh Cookie header from a signed-in "
+    "music.youtube.com tab into the Cookie header field of this provider's "
+    "settings and save. Error: `{reason}`"
+)
+
+# The notice quotes the error so a bug report can be made from a screenshot,
+# but some of them (the 401 from Google) run to several sentences.
+AUTH_NOTICE_REASON_MAX = 200
+
+# A cookie pair as it appears inside an error message: name= then the value.
+_COOKIE_VALUE_RE = re.compile(r"([\w.-]+=)[^;\s'\"]+")
 
 # Music Assistant's core search controller sanitizes the query before handing it
 # to a provider, replacing every "/" with a space and stripping "'"
@@ -709,6 +762,33 @@ def _description_text(value: Any) -> str | None:
 def _normalize_artist_name(value: str) -> str:
     """Fold an artist name to a form two spellings of it can both match."""
     return " ".join(str(value).split()).casefold()
+
+
+def _redact_cookie_values(text: str) -> str:
+    """Blank every ``name=value`` pair in an error message.
+
+    requests quotes a whole header value when it rejects one, and the notice is
+    stored in plain text and shown to anyone the provider is shared with.
+    """
+    return _COOKIE_VALUE_RE.sub(r"\1<redacted>", text)
+
+
+class _CookieRejected(RuntimeError):
+    """The cookie itself is unusable: malformed, or signed out."""
+
+
+def _auth_notice_reason(err: Exception) -> str:
+    """Condense an auth error into one line that is safe inside a code span.
+
+    The notice is rendered as Markdown, and a raw cookie error such as "Cookie
+    must contain __Secure-3PAPISID" would lose its underscores to emphasis. The
+    caller wraps this in backticks, so backticks inside it are swapped out.
+    """
+    text = " ".join(str(err).split()) or type(err).__name__
+    text = _redact_cookie_values(text).replace("`", "'")
+    if len(text) > AUTH_NOTICE_REASON_MAX:
+        text = text[: AUTH_NOTICE_REASON_MAX - 3].rstrip() + "..."
+    return text
 
 
 def _search_tokens(value: str) -> set[str]:
@@ -1087,6 +1167,17 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _ai_blocklist_task: object = None
     _authenticated: bool = False
     _auth_lapse_warned: bool = False
+    # The auth notice this instance wants shown in the Music Assistant UI, and
+    # the one it last wrote there. None means no notice. See _sync_auth_notice.
+    _auth_notice: str | None = None
+    _auth_notice_shown: str | None = None
+    # Error code the notice is written with. None means LoginFailed, shown as
+    # "Authentication required"; a startup failure that does not point at the
+    # cookie uses SetupFailedError, which gets Music Assistant's Reload button.
+    _auth_notice_code: int | None = None
+    # Waits for Music Assistant to finish loading the instance before the first
+    # write; held so it is not garbage collected and so unload can cancel it.
+    _auth_notice_task: object = None
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
     # genuinely empty library apart from a partial-auth HTTP 200 response that
     # ytmusicapi unwraps to []. See issue #10.
@@ -1131,13 +1222,18 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
-            cookie = self.config.get_value(CONF_COOKIE) or ""
+            # Stripped: a leading space left over from deleting a copied
+            # "Cookie:" prefix makes requests reject the header outright.
+            cookie = (self.config.get_value(CONF_COOKIE) or "").strip()
             if cookie:
                 try:
                     brand_account = self.config.get_value(CONF_BRAND_ACCOUNT) or None
-                    auth_headers = self._build_auth_headers(
-                        cookie, self._configured_auth_user()
-                    )
+                    try:
+                        auth_headers = self._build_auth_headers(
+                            cookie, self._configured_auth_user()
+                        )
+                    except ValueError as err:
+                        raise _CookieRejected(str(err)) from err
                     self._ytmusic = await asyncio.to_thread(
                         self._create_ytmusic_client, auth=auth_headers, user=brand_account
                     )
@@ -1157,7 +1253,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     if not songs and await asyncio.to_thread(
                         self._probe_session_alive
                     ) is False:
-                        raise RuntimeError(
+                        raise _CookieRejected(
                             "the cookie was accepted but the account is not "
                             "signed in (YouTube answers a lapsed session with "
                             "an empty library rather than an auth error)"
@@ -1169,20 +1265,171 @@ class YoutubeMusicFreeProvider(MusicProvider):
                         "library sync enabled"
                     )
                 except Exception as err:
-                    self.logger.warning(
-                        "Cookie authentication failed (%s), falling back to anonymous mode. "
-                        "You may need to refresh your cookie.",
-                        err,
-                    )
                     self._authenticated = False
+                    # The notice is shown once Music Assistant has finished
+                    # loading us: it clears the error field after a successful
+                    # load, so a write from here would be wiped. See
+                    # loaded_in_mass.
+                    reason = _auth_notice_reason(err)
+                    if self._blames_cookie(err):
+                        self.logger.warning(
+                            "Cookie authentication failed (%s), falling back to "
+                            "anonymous mode. You may need to refresh your cookie.",
+                            _redact_cookie_values(str(err)),
+                        )
+                        self._auth_notice = AUTH_NOTICE_COOKIE_FAILED.format(reason=reason)
+                    else:
+                        # A network error, a timeout, a 5xx or a response
+                        # ytmusicapi could not parse. Telling the user to
+                        # replace a cookie that may be fine sends them the
+                        # wrong way, so this gets its own text, coded as a
+                        # setup failure: Music Assistant then offers Reload.
+                        self.logger.warning(
+                            "Could not verify the cookie (%s), falling back to "
+                            "anonymous mode. Reload the provider once YouTube "
+                            "Music is reachable.",
+                            _redact_cookie_values(str(err)),
+                        )
+                        self._auth_notice = AUTH_NOTICE_COOKIE_UNVERIFIED.format(
+                            reason=reason
+                        )
+                        self._auth_notice_code = SetupFailedError.error_code
                     self._ytmusic = await asyncio.to_thread(self._create_ytmusic_client)
             else:
+                # Cookie auth chosen and the field left empty. Every library
+                # sync fails over it (_require_library_auth), so this used to
+                # be the quietest way to end up without a library.
+                self.logger.warning(
+                    "Cookie authentication is selected but no cookie is set, "
+                    "running in anonymous mode."
+                )
+                self._auth_notice = AUTH_NOTICE_COOKIE_MISSING
                 self._ytmusic = await asyncio.to_thread(self._create_ytmusic_client)
         else:
             self._ytmusic = await asyncio.to_thread(self._create_ytmusic_client)
 
         if not self._authenticated:
             self.logger.info("YouTube Music (Free) initialized — anonymous mode")
+
+    async def loaded_in_mass(self) -> None:
+        """Arrange for the auth notice to be shown once loading has finished.
+
+        Music Assistant clears the provider's error field after every successful
+        load, so the notice cannot be written from ``handle_async_init``. On
+        2.10.5 that clear also runs after this method returns, so it cannot be
+        written from here either.
+
+        The write runs in a task of its own that waits for ``initialized``.
+        What keeps it after the clear is that the task only ever runs through
+        the event loop: 2.11 clears before starting the post-load step, and
+        2.10.5 clears synchronously right after starting it, before the loop
+        gets a turn. The event alone does not order the two, because 2.10.5
+        starts the post-load step eagerly and sets it before the clear. Waiting
+        inline would deadlock: the event is only set once this method returns.
+        test_notice_survives_the_servers_clear pins both orderings.
+        """
+        await super().loaded_in_mass()
+        self._auth_notice_task = asyncio.get_running_loop().create_task(
+            self._show_auth_notice_when_loaded()
+        )
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """Stop a pending auth notice from landing on an unloaded instance."""
+        task = self._auth_notice_task
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+        await super().unload(is_removed)
+
+    async def _show_auth_notice_when_loaded(self) -> None:
+        """Write the auth notice as soon as Music Assistant has finished loading."""
+        initialized = getattr(self, "initialized", None)
+        if initialized is not None:
+            await initialized.wait()
+        self._sync_auth_notice()
+
+    def _blames_cookie(self, err: Exception) -> bool:
+        """Whether a startup auth failure is evidence against the cookie itself."""
+        if isinstance(err, _CookieRejected) or self._is_auth_lapse(err):
+            return True
+        # ytmusicapi's own complaint about the credentials, and requests
+        # refusing a header value the cookie made invalid. Matched by name, as
+        # neither package can be imported in the unit suite.
+        names = {cls.__name__ for cls in type(err).__mro__}
+        return bool(names & {"YTMusicUserError", "InvalidHeader"})
+
+    def _is_loaded(self) -> bool:
+        """Whether Music Assistant has finished loading this instance."""
+        initialized = getattr(self, "initialized", None)
+        return initialized is not None and initialized.is_set()
+
+    def _raise_auth_notice(self, err: Exception) -> None:
+        """Show that a cookie which worked at startup has stopped working.
+
+        Keeps the first notice rather than replacing it with every later error,
+        so one lapse is one write. Before the instance has finished loading the
+        pending task picks it up instead.
+        """
+        if self._auth_notice is not None:
+            return
+        self._auth_notice = AUTH_NOTICE_COOKIE_LAPSED.format(reason=_auth_notice_reason(err))
+        self._auth_notice_code = None
+        if self._is_loaded():
+            self._sync_auth_notice()
+
+    def _clear_auth_notice(self) -> None:
+        """Withdraw a lapse notice once the session has proved to be alive."""
+        if self._auth_notice is None:
+            return
+        self._auth_notice = None
+        if self._is_loaded():
+            self._sync_auth_notice()
+
+    def _sync_auth_notice(self) -> None:
+        """Bring the provider's error in the Music Assistant UI in line with ours.
+
+        The error field is the one channel Music Assistant has for a provider
+        that is running but needs attention: it puts a badge on the provider
+        list, a banner on the provider's settings page and a hint on the home
+        page, and it survives restarts until the next successful load clears it.
+        It also has no softer level than an error, which is why the notice text
+        says plainly what still works.
+
+        Coded as LoginFailed by default, which Music Assistant shows as
+        "Authentication required"; see ``_auth_notice_code`` for the exception.
+        ``translation_key`` stays unset on purpose: with one, Music Assistant
+        replaces the message with its generic "Login failed" text.
+
+        Best effort throughout. Failing to show the notice must never break the
+        provider it is about.
+        """
+        notice = self._auth_notice
+        if notice == self._auth_notice_shown:
+            return
+        mass = self.mass
+        update = getattr(getattr(mass, "config", None), "update_provider_last_error", None)
+        if update is None or ProviderError is None:
+            # Music Assistant 2.9.x, or no server at all in tests.
+            return
+        if not hasattr(mass, "providers"):
+            self.logger.debug("The server has no provider list; auth notice not shown")
+            return
+        if not any(provider is self for provider in mass.providers):
+            # Unloaded, or replaced by a reload whose own load just cleared the
+            # field. Writing now would pin this instance's notice on that one.
+            return
+        code = self._auth_notice_code or LoginFailed.error_code
+        try:
+            update(
+                self.instance_id,
+                ProviderError(error_code=code, message=notice) if notice else None,
+            )
+            # update_provider_last_error sends no event of its own, and on
+            # 2.10.5 the load's own PROVIDERS_UPDATED has already gone out.
+            mass.signal_event(EventType.PROVIDERS_UPDATED, data=mass.providers)
+        except Exception as err:
+            self.logger.debug("Could not update the auth notice in the UI: %s", err)
+            return
+        self._auth_notice_shown = notice
 
     def _create_ytmusic_client(
         self, auth: dict[str, str] | None = None, user: str | None = None
@@ -2680,6 +2927,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """
         self._record_library_count(category, count)
         if count > 0:
+            # A populated answer is proof the session works, so a lapse notice
+            # raised by an earlier one-off error has outlived its cause.
+            if self._authenticated:
+                self._clear_auth_notice()
             return
         alive = await asyncio.to_thread(self._probe_session_alive)
         if alive is None:
@@ -2695,17 +2946,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
             return
         if alive:
+            if self._authenticated:
+                self._clear_auth_notice()
             return
         err = RuntimeError(
             "Library returned empty but the session probe reports the account "
             "is not signed in (suspected cookie lapse, issues #10 and #55)"
         )
         self._warn_library_error(f"get_library_{category}", err)
+        # The lapse pattern does not match this wording, so _warn_library_error
+        # leaves the notice alone. The probe is the stronger evidence of the two.
+        if self._authenticated:
+            self._raise_auth_notice(err)
         raise err
 
     def _warn_library_error(self, context: str, err: Exception) -> None:
         """Log a library-call failure, upgrading the message on suspected auth lapse."""
         if self._is_auth_lapse(err):
+            # Only for a cookie that worked at startup. One that never did
+            # already has its notice from handle_async_init.
+            if self._authenticated:
+                self._raise_auth_notice(err)
             if not self._auth_lapse_warned:
                 self._auth_lapse_warned = True
                 self.logger.warning(

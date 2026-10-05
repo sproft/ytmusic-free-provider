@@ -199,3 +199,25 @@ FORBIDDEN_STREAM_DETAILS_FIELDS: tuple[str, ...] = (
     "not_before",
     "start_after",
 )
+
+# The auth notice (issue #92). While cookie auth is configured but not working,
+# the provider writes a ``ProviderError`` as its last_error and signals
+# ``PROVIDERS_UPDATED`` so open UIs refetch. ``translation_key`` has to exist and
+# default to None: the provider leaves it unset, and a key there would make Music
+# Assistant replace the notice with its generic "Login failed" text.
+REQUIRED_EVENT_TYPE_MEMBERS: tuple[str, ...] = ("PROVIDERS_UPDATED",)
+REQUIRED_PROVIDER_ERROR_FIELDS: tuple[str, ...] = (
+    "error_code",
+    "message",
+    "translation_key",
+)
+
+# ``LoginFailed.error_code``. The server maps it to the "Authentication
+# required" status, which is the badge the notice is meant to carry; another
+# code would read "Setup failed" over a provider that is running.
+LOGIN_FAILED_ERROR_CODE = 6
+
+# ``SetupFailedError.error_code``. Used for a startup failure that does not point
+# at the cookie (network, 5xx, parse error): the server shows it as ERROR, and
+# on that status the provider's settings page offers a Reload button.
+SETUP_FAILED_ERROR_CODE = 5

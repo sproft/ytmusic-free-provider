@@ -60,10 +60,21 @@ def _install_music_assistant_models() -> None:
         depends_on_value: list | None = None
         description: str | None = None
 
+    @dataclass
+    class _ProviderError:
+        # Mirrors the upstream field order. translation_key must default to
+        # None: the provider leaves it unset so its own message is shown.
+        error_code: int
+        message: str
+        translation_key: str | None = None
+        translation_args: list = field(default_factory=list)
+        translation_owner: str | None = None
+
     config_entries.ConfigEntry = _ConfigEntry
     config_entries.ConfigValueOption = _ConfigValueOption
     config_entries.ConfigValueType = object
     config_entries.ProviderConfig = object
+    config_entries.ProviderError = _ProviderError
 
     enums = _new_module("music_assistant_models.enums")
 
@@ -136,9 +147,13 @@ def _install_music_assistant_models() -> None:
         HTTP = "http"
         CUSTOM = "custom"
 
+    class _EventType(str, Enum):
+        PROVIDERS_UPDATED = "providers_updated"
+
     enums.AlbumType = _AlbumType
     enums.ConfigEntryType = _ConfigEntryType
     enums.ContentType = _ContentType
+    enums.EventType = _EventType
     enums.ImageType = _ImageType
     enums.MediaType = _MediaType
     enums.ProviderFeature = _ProviderFeature
@@ -147,21 +162,29 @@ def _install_music_assistant_models() -> None:
     errors = _new_module("music_assistant_models.errors")
 
     class _MAError(Exception):
-        pass
+        error_code = 0
 
     class _InvalidDataError(_MAError):
         pass
+
+    class _LoginFailed(_MAError):
+        # Upstream value, pinned in tests/ma_contract.py: Music Assistant maps
+        # it to the "Authentication required" status.
+        error_code = 6
 
     class _MediaNotFoundError(_MAError):
         pass
 
     class _SetupFailedError(_MAError):
-        pass
+        # Upstream value, pinned in tests/ma_contract.py: the startup notice
+        # that does not blame the cookie is written with it.
+        error_code = 5
 
     class _UnplayableMediaError(_MAError):
         pass
 
     errors.InvalidDataError = _InvalidDataError
+    errors.LoginFailed = _LoginFailed
     errors.MediaNotFoundError = _MediaNotFoundError
     errors.SetupFailedError = _SetupFailedError
     errors.UnplayableMediaError = _UnplayableMediaError
@@ -401,6 +424,7 @@ def _install_music_assistant() -> None:
         name: str = "YouTube Music (Free)"
 
         def __init__(self, mass=None, manifest=None, config=None, supported_features=None):
+            import asyncio
             import logging
 
             self.mass = mass
@@ -408,6 +432,15 @@ def _install_music_assistant() -> None:
             self.config = config
             self.supported_features = supported_features or set()
             self.logger = logging.getLogger("ytmusic_free_test")
+            # Set by Music Assistant once loaded_in_mass has returned. See
+            # verify_server_contract.
+            self.initialized = asyncio.Event()
+
+        async def loaded_in_mass(self) -> None:
+            return None
+
+        async def unload(self, is_removed: bool = False) -> None:
+            return None
 
     music_provider_mod.MusicProvider = _MusicProvider
     models.music_provider = music_provider_mod
