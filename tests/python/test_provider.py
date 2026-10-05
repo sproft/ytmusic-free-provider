@@ -822,6 +822,29 @@ def test_notice_reason_is_one_short_line_without_backticks():
     assert reason.startswith("first line second 'quoted' line")
 
 
+def test_notice_reason_never_quotes_cookie_values():
+    """requests embeds a rejected header value in its error message."""
+    err = ValueError(
+        "Invalid leading whitespace in header value: ' SID=abc123; HSID=def456; SSID=ghi'"
+    )
+
+    reason = ytm._auth_notice_reason(err)
+
+    for secret in ("abc123", "def456", "ghi"):
+        assert secret not in reason
+    assert "SID=<redacted>" in reason
+
+
+def test_cookie_with_surrounding_whitespace_still_authenticates(monkeypatch):
+    instance = _setup_instance(
+        monkeypatch,
+        "inst_cookie_space",
+        {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE, ytm.CONF_COOKIE: "  __Secure-3PAPISID=a; SAPISID=b \n"},
+    )
+    assert instance._authenticated is True
+    assert instance._created_clients[0]["auth"]["cookie"] == "__Secure-3PAPISID=a; SAPISID=b"
+
+
 def test_notice_reason_falls_back_to_the_exception_type():
     assert ytm._auth_notice_reason(RuntimeError()) == "RuntimeError"
 

@@ -435,6 +435,9 @@ AUTH_NOTICE_COOKIE_LAPSED = (
 # but some of them (the 401 from Google) run to several sentences.
 AUTH_NOTICE_REASON_MAX = 200
 
+# A cookie pair as it appears inside an error message: name= then the value.
+_COOKIE_VALUE_RE = re.compile(r"([\w.-]+=)[^;\s'\"]+")
+
 # Music Assistant's core search controller sanitizes the query before handing it
 # to a provider, replacing every "/" with a space and stripping "'"
 # (controllers/music.py: search_query.replace("/", " ").replace("'", "")). This
@@ -761,6 +764,10 @@ def _auth_notice_reason(err: Exception) -> str:
     caller wraps this in backticks, so backticks inside it are swapped out.
     """
     text = " ".join(str(err).split()) or type(err).__name__
+    # requests quotes the whole header value when it rejects one (a cookie
+    # pasted with a leading space, say), and the notice is stored in plain text
+    # and invites screenshots. Blank every name=value pair.
+    text = _COOKIE_VALUE_RE.sub(r"\1<redacted>", text)
     text = text.replace("`", "'")
     if len(text) > AUTH_NOTICE_REASON_MAX:
         text = text[: AUTH_NOTICE_REASON_MAX - 3].rstrip() + "..."
@@ -1194,7 +1201,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
-            cookie = self.config.get_value(CONF_COOKIE) or ""
+            # Stripped: a leading space left over from deleting a copied
+            # "Cookie:" prefix makes requests reject the header outright.
+            cookie = (self.config.get_value(CONF_COOKIE) or "").strip()
             if cookie:
                 try:
                     brand_account = self.config.get_value(CONF_BRAND_ACCOUNT) or None
