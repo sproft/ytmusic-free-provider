@@ -31,7 +31,7 @@ import pytest
 # Imports below are resolved against the stubs registered in conftest.py.
 from music_assistant_models.config_entries import ProviderError
 from music_assistant_models.enums import ContentType, EventType, MediaType, StreamType
-from music_assistant_models.errors import LoginFailed
+from music_assistant_models.errors import LoginFailed, SetupFailedError
 
 # Imported from media_items, not streamdetails, because that is the path the
 # provider itself uses. Upstream re-exports the same class from both.
@@ -256,3 +256,7 @@ def test_stub_provider_error_leaves_the_translation_key_unset():
 
 def test_stub_login_failed_code_matches():
     assert LoginFailed.error_code == ma_contract.LOGIN_FAILED_ERROR_CODE
+
+
+def test_stub_setup_failed_code_matches():
+    assert SetupFailedError.error_code == ma_contract.SETUP_FAILED_ERROR_CODE

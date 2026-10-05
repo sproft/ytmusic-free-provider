@@ -176,7 +176,9 @@ def _install_music_assistant_models() -> None:
         pass
 
     class _SetupFailedError(_MAError):
-        pass
+        # Upstream value, pinned in tests/ma_contract.py: the startup notice
+        # that does not blame the cookie is written with it.
+        error_code = 5
 
     class _UnplayableMediaError(_MAError):
         pass
@@ -430,8 +432,8 @@ def _install_music_assistant() -> None:
             self.config = config
             self.supported_features = supported_features or set()
             self.logger = logging.getLogger("ytmusic_free_test")
-            # Set by Music Assistant once loaded_in_mass has returned, after
-            # it has cleared the provider's last_error. See verify_server_contract.
+            # Set by Music Assistant once loaded_in_mass has returned. See
+            # verify_server_contract.
             self.initialized = asyncio.Event()
 
         async def loaded_in_mass(self) -> None:

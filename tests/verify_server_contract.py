@@ -89,16 +89,32 @@ def check_auth_notice_contract() -> None:
     """
     from music_assistant_models.config_entries import ProviderConfig, ProviderError
     from music_assistant_models.enums import ProviderStatus, ProviderType
-    from music_assistant_models.errors import LoginFailed
+    from music_assistant_models.errors import LoginFailed, SetupFailedError
 
     from music_assistant.controllers.config import ConfigController
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models.provider import Provider
 
-    if not callable(getattr(ConfigController, "update_provider_last_error", None)):
+    update = getattr(ConfigController, "update_provider_last_error", None)
+    if not callable(update):
         raise SystemExit(
             "ConfigController.update_provider_last_error is gone; the cookie auth "
             "notice can no longer be shown. See issue #92."
         )
+    # The provider calls it as update(instance_id, error); a TypeError there is
+    # swallowed into a debug log.
+    try:
+        inspect.signature(update).bind(None, "instance_id", None)
+    except TypeError as err:
+        raise SystemExit(
+            f"update_provider_last_error no longer takes (instance_id, error): {err}"
+        ) from err
+    # _sync_auth_notice checks the instance is still registered through this
+    # property and skips the write without it.
+    if not isinstance(inspect.getattr_static(MusicAssistant, "providers", None), property):
+        raise SystemExit("MusicAssistant.providers is gone; the auth notice is never written.")
+    if "data" not in inspect.signature(MusicAssistant.signal_event).parameters:
+        raise SystemExit("MusicAssistant.signal_event lost its data parameter.")
     for hook in ("loaded_in_mass", "unload"):
         if not callable(getattr(Provider, hook, None)):
             raise SystemExit(f"Provider base lost {hook}(); the auth notice relies on it.")
@@ -116,19 +132,26 @@ def check_auth_notice_contract() -> None:
     except ImportError:
         print("auth notice: _provider_status not found, status mapping not checked")
     else:
-        conf = ProviderConfig(
-            values={},
-            type=ProviderType.MUSIC,
-            domain="ytmusic_free",
-            instance_id="ytmusic_free--contract",
-            last_error=ProviderError(error_code=LoginFailed.error_code, message="notice"),
-        )
-        status = _provider_status(conf, True)
-        if status != ProviderStatus.AUTH_REQUIRED:
-            raise SystemExit(
-                f"a loaded provider with a LoginFailed last_error now reads {status}, "
-                "not AUTH_REQUIRED; revisit the error code in _sync_auth_notice."
+        expected = {
+            LoginFailed.error_code: ProviderStatus.AUTH_REQUIRED,
+            # The startup notice that does not blame the cookie. ERROR is the
+            # status the provider settings page offers its Reload button on.
+            SetupFailedError.error_code: ProviderStatus.ERROR,
+        }
+        for code, wanted in expected.items():
+            conf = ProviderConfig(
+                values={},
+                type=ProviderType.MUSIC,
+                domain="ytmusic_free",
+                instance_id="ytmusic_free--contract",
+                last_error=ProviderError(error_code=code, message="notice"),
             )
+            status = _provider_status(conf, True)
+            if status != wanted:
+                raise SystemExit(
+                    f"a loaded provider with last_error code {code} now reads {status}, "
+                    f"not {wanted}; revisit the error codes in _sync_auth_notice."
+                )
     print("auth notice contract ok")
 
 

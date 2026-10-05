@@ -216,3 +216,8 @@ REQUIRED_PROVIDER_ERROR_FIELDS: tuple[str, ...] = (
 # required" status, which is the badge the notice is meant to carry; another
 # code would read "Setup failed" over a provider that is running.
 LOGIN_FAILED_ERROR_CODE = 6
+
+# ``SetupFailedError.error_code``. Used for a startup failure that does not point
+# at the cookie (network, 5xx, parse error): the server shows it as ERROR, and
+# on that status the provider's settings page offers a Reload button.
+SETUP_FAILED_ERROR_CODE = 5

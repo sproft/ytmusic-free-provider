@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import types
 from unittest.mock import MagicMock
@@ -654,7 +655,9 @@ def test_notice_is_written_only_after_music_assistant_finishes_loading(monkeypat
     """Music Assistant clears last_error after a successful load.
 
     On 2.10.5 that clear runs after loaded_in_mass, so writing any earlier gets
-    the notice wiped. ``initialized`` is set after the clear on every version.
+    the notice wiped. The write waits for ``initialized`` and only runs through
+    the event loop; test_notice_survives_the_servers_clear checks that this
+    lands it after the clear on both server versions.
     """
     instance = _setup_instance(monkeypatch, "inst_notice_wait", _BAD_COOKIE)
     mass = _attach_mass(instance)
@@ -717,13 +720,55 @@ def test_unload_cancels_a_pending_notice(monkeypatch):
         await instance.loaded_in_mass()
         await asyncio.sleep(0)
         await instance.unload()
-        await asyncio.sleep(0)
-        return instance._auth_notice_task
+        # Release the waiter as a late load would. The fake server still lists
+        # the instance, so only the cancel in unload can stop the write.
+        instance.initialized.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        # Read inside the loop: asyncio.run cancels leftover tasks on exit.
+        return instance._auth_notice_task.cancelled(), list(mass.config.writes)
 
-    task = asyncio.run(_scenario())
+    cancelled, writes = asyncio.run(_scenario())
 
-    assert task.cancelled()
-    assert mass.config.writes == []
+    assert cancelled
+    assert writes == []
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="eager tasks need Python 3.12")
+@pytest.mark.parametrize("server", ["2.10.5", "2.11"])
+def test_notice_survives_the_servers_clear(monkeypatch, server):
+    """Model both servers' post-load ordering and check the final stored value.
+
+    2.11 clears last_error, then starts the post-load step. 2.10.5 starts the
+    post-load step eagerly (loaded_in_mass and ``initialized.set()`` run right
+    away) and clears synchronously afterwards. The notice has to be the last
+    write in both.
+    """
+    instance = _setup_instance(monkeypatch, f"inst_notice_order_{server}", _BAD_COOKIE)
+    mass = _attach_mass(instance)
+
+    def _clear():
+        mass.config.writes.append((instance.instance_id, None))
+
+    async def _post_load():
+        await instance.loaded_in_mass()
+        instance.initialized.set()
+
+    async def _scenario():
+        loop = asyncio.get_running_loop()
+        if server == "2.11":
+            _clear()
+            post_load = asyncio.Task(_post_load(), loop=loop, eager_start=True)
+        else:
+            post_load = asyncio.Task(_post_load(), loop=loop, eager_start=True)
+            _clear()
+        await post_load
+        await instance._auth_notice_task
+
+    asyncio.run(_scenario())
+
+    assert mass.config.writes[-1][1] is not None
+    assert mass.config.writes[-1][1].message == instance._auth_notice
 
 
 @pytest.mark.parametrize("mass", [None, types.SimpleNamespace(config=object())])
@@ -765,6 +810,127 @@ def test_runtime_auth_lapse_raises_the_notice_once(monkeypatch):
     _, error = mass.config.writes[0]
     assert error.message.startswith("YouTube stopped accepting the cookie")
     assert "`Server returned HTTP 401`" in error.message
+
+
+def test_a_lapse_before_loading_finishes_waits_for_the_pending_task(monkeypatch):
+    """A lapse after registration but before the server clears last_error.
+
+    Music Assistant registers the instance before it clears the field, so a
+    write from this window would be wiped and, being marked shown, never
+    repeated. The pending task has to write it instead.
+    """
+    instance, _ = _setup_cookie_instance(
+        monkeypatch,
+        "inst_notice_early",
+        library=[{"videoId": "v1"}],
+        account_info={"accountName": "A"},
+    )
+    mass = _attach_mass(instance)
+
+    async def _scenario():
+        instance._warn_library_error("get_library_songs", RuntimeError("Server returned HTTP 401"))
+        writes_before = list(mass.config.writes)
+        await instance.loaded_in_mass()
+        instance.initialized.set()
+        await instance._auth_notice_task
+        return writes_before
+
+    writes_before = asyncio.run(_scenario())
+
+    assert writes_before == []
+    assert len(mass.config.writes) == 1
+    assert mass.config.writes[0][1].message.startswith("YouTube stopped accepting the cookie")
+
+
+def _setup_cookie_instance_failing(monkeypatch, instance_id, error):
+    """Cookie instance whose validation call raises ``error``."""
+    instance = _make_provider(instance_id)
+    instance.config = _StubConfig(
+        {ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE, ytm.CONF_COOKIE: "__Secure-3PAPISID=a; SID=b"}
+    )
+
+    async def _noop():
+        return None
+
+    client = MagicMock()
+    client.get_library_songs = MagicMock(side_effect=error)
+    monkeypatch.setattr(instance, "_install_packages", _noop)
+    monkeypatch.setattr(instance, "_purge_legacy_auth_file", _noop)
+    monkeypatch.setattr(instance, "_create_ytmusic_client", lambda auth=None, user=None: client)
+    monkeypatch.setattr(instance, "_build_auth_headers", lambda cookie, user: {"Cookie": cookie})
+    handler = _attach_capture(instance)
+    asyncio.run(instance.handle_async_init())
+    return instance, handler
+
+
+class YTMusicUserError(Exception):
+    """Same name as ytmusicapi's credentials error, which is matched by name."""
+
+
+class InvalidHeader(ValueError):
+    """Same name as the requests error for a header value it refuses."""
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("Server returned HTTP 401: Unauthorized."),
+        YTMusicUserError("Please provide authentication before using this function"),
+        InvalidHeader("Invalid return character or leading space in header: cookie"),
+    ],
+    ids=["http-401", "ytmusicapi-user-error", "invalid-header"],
+)
+def test_startup_errors_about_the_cookie_get_the_cookie_notice(monkeypatch, error):
+    instance, _ = _setup_cookie_instance_failing(monkeypatch, "inst_notice_cookie_err", error)
+
+    assert instance._auth_notice.startswith("Cookie authentication failed")
+    assert instance._auth_notice_code is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("Failed to resolve 'music.youtube.com'"),
+        TimeoutError("Read timed out"),
+        RuntimeError("Server returned HTTP 503: Service Unavailable."),
+        json.JSONDecodeError("Expecting value", "<html>", 0),
+    ],
+    ids=["dns", "timeout", "http-503", "parse"],
+)
+def test_startup_errors_elsewhere_do_not_blame_the_cookie(monkeypatch, error):
+    """A network blip at boot must not send the user to recapture a good cookie."""
+    instance, handler = _setup_cookie_instance_failing(monkeypatch, "inst_notice_net", error)
+    mass = _attach_mass(instance)
+    instance.initialized.set()
+
+    instance._sync_auth_notice()
+
+    assert instance._auth_notice.startswith("The cookie could not be checked")
+    _, written = mass.config.writes[0]
+    # Shown as ERROR, where the settings page offers Reload.
+    assert written.error_code == ytm.SetupFailedError.error_code
+    joined = " ".join(handler.messages())
+    assert "refresh your cookie" not in joined
+    assert "Could not verify the cookie" in joined
+
+
+def test_startup_log_does_not_quote_cookie_values(monkeypatch):
+    error = InvalidHeader("Invalid leading whitespace in header value: ' SID=abc123; HSID=def'")
+    instance, handler = _setup_cookie_instance_failing(monkeypatch, "inst_notice_log", error)
+
+    joined = " ".join(handler.messages())
+    assert "abc123" not in joined
+    assert "abc123" not in instance._auth_notice
+
+
+def test_proxy_407_is_not_a_cookie_lapse(provider):
+    err = RuntimeError(
+        "HTTPSConnectionPool(host='music.youtube.com', port=443): Max retries exceeded "
+        "(Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection "
+        "failed: 407 Proxy Authentication Required')))"
+    )
+    assert provider._is_auth_lapse(err) is False
+    assert provider._is_auth_lapse(RuntimeError("Authentication required")) is True
 
 
 def test_non_auth_library_errors_raise_no_notice(monkeypatch):

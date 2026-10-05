@@ -286,3 +286,8 @@ def test_provider_error_keeps_a_custom_message_without_a_translation_key(real_mo
 def test_login_failed_code_is_unchanged(real_models):
     """The server maps this code to the "Authentication required" status."""
     assert real_models.errors.LoginFailed.error_code == ma_contract.LOGIN_FAILED_ERROR_CODE
+
+
+def test_setup_failed_code_is_unchanged(real_models):
+    """The non-cookie startup notice uses it; the server maps it to ERROR."""
+    assert real_models.errors.SetupFailedError.error_code == ma_contract.SETUP_FAILED_ERROR_CODE
