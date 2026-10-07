@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import asyncio
 import importlib
@@ -119,8 +119,28 @@ STREAM_CHUNK_SIZE = 1024 * 1024
 
 # Give-up point for that halving. Below this, request overhead dominates and a
 # 403 is clearly not about the range size anymore (1 KiB probes pass even when
-# 10 MiB fails), so keep shrinking would only mask a different failure.
+# 10 MiB fails), so keep shrinking would only mask a different failure. A 403
+# at the floor means the URL itself has stopped serving; see
+# MAX_STREAM_URL_REFRESHES for what happens next.
 STREAM_CHUNK_FLOOR = 64 * 1024
+
+# How many fresh URLs get_audio_stream resolves for one track, in a row and
+# without a byte of progress, before it gives up and the track is skipped.
+#
+# Since early October 2026 some googlevideo URLs only serve the first minute or
+# so of the file (about 1 MB of Opus) and answer 403 to every range past it,
+# however small, from the very first request on. Measured on 2026-10-06 against
+# the VISIONOS URLs that yt-dlp's defaults extract: 13 of 163 extractions,
+# across a 31-track radio queue and repeated extractions of five of its tracks.
+# Before this the track simply stopped about a minute in and Music Assistant
+# moved on to the next one.
+#
+# The cap is a property of the individual URL. The next extraction of the same
+# track almost always serves the whole file, and it serves the same encode, so
+# the stream resumes on the fresh URL at the byte where the capped one
+# stopped. Two capped URLs in a row were observed too, hence more than one
+# attempt. Waiting does not help: a capped URL still refused 150 seconds later.
+MAX_STREAM_URL_REFRESHES = 4
 
 # How much of a chunk's body to hand over per yield. Purely a buffering knob
 # for the pipe into ffmpeg; it has no effect on the HTTP requests.
@@ -986,6 +1006,19 @@ def _content_range_total(value: str | None) -> int | None:
         return None
     total = value.rsplit("/", 1)[1].strip()
     return int(total) if total.isdigit() else None
+
+
+def _stream_encode(url: str | None) -> tuple[str, str, str] | None:
+    """Identify the file behind a googlevideo URL as ``(itag, clen, lmt)``.
+
+    Format, byte length and the encode's modification stamp. Two URLs that
+    agree on all three serve byte-identical files, which is what lets a stream
+    move from one URL to the other in the middle of the file. None when any of
+    the three is missing, so a URL that cannot be identified is never spliced.
+    """
+    query = parse_qs(urlparse(url or "").query)
+    encode = tuple(query.get(key, [""])[0] for key in ("itag", "clen", "lmt"))
+    return encode if all(encode) else None
 
 
 async def setup(
@@ -2642,29 +2675,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
             "Resolved stream format '%s' for track %s", stream_format.get("format"), video_id
         )
 
-        # Sit out any pre-roll ad window before handing the URL over, because
-        # fetching inside it returns 403 (issue #51). Ahead of the expiration
-        # maths below, so the TTL we report is measured from the moment Music
-        # Assistant actually receives the URL rather than from before the wait.
-        if self._preroll_supported and (wait := _preroll_wait_seconds(stream_format)):
-            if wait > MAX_PREROLL_WAIT:
-                self.logger.warning(
-                    "Track %s reports a %.0fs pre-roll window, beyond the %.0fs "
-                    "we are willing to hold playback for. Handing the url over "
-                    "now; it will most likely be refused with a 403 and the "
-                    "track skipped.",
-                    video_id,
-                    wait,
-                    MAX_PREROLL_WAIT,
-                )
-            else:
-                self.logger.debug(
-                    "Waiting %.1fs for the pre-roll ad window on track %s before "
-                    "handing over the stream url",
-                    wait,
-                    video_id,
-                )
-                await asyncio.sleep(wait)
+        # Sit out any pre-roll ad window first (issue #51). Ahead of the
+        # expiration maths below, so the TTL we report is measured from the
+        # moment Music Assistant actually receives the URL rather than from
+        # before the wait.
+        await self._sit_out_preroll(stream_format, video_id)
 
         url = stream_format["url"]
         expiration = DEFAULT_STREAM_URL_EXPIRATION
@@ -2707,6 +2722,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 # yt-dlp's per-format headers (User-Agent etc.), sent on every
                 # chunk so the fetch looks like the client that minted the URL.
                 "headers": dict(stream_format.get("http_headers") or {}),
+                # The bare id, so get_audio_stream can resolve a fresh URL when
+                # this one stops serving partway (MAX_STREAM_URL_REFRESHES).
+                "video_id": video_id,
             },
         )
         if channels := stream_format.get("audio_channels"):
@@ -2765,6 +2783,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
         response's ``Content-Range``, and a chunk answering with fewer bytes
         than asked for. The second also covers a server that ignores the range
         and answers 200 with the whole body.
+
+        A URL that stops serving partway, refusing even a range at
+        STREAM_CHUNK_FLOOR, is swapped for a freshly resolved URL to the same
+        file, and the stream carries on from the same byte. See
+        MAX_STREAM_URL_REFRESHES.
         """
         del seek_position  # always 0, see docstring
         data = streamdetails.data if isinstance(streamdetails.data, dict) else {}
@@ -2773,6 +2796,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
         chunk_size = STREAM_CHUNK_SIZE
         pos = 0
         total: int | None = None
+        # Fresh URLs resolved since the stream last moved forward.
+        refreshes = 0
         while total is None or pos < total:
             end = pos + chunk_size - 1
             if total is not None:
@@ -2780,42 +2805,56 @@ class YoutubeMusicFreeProvider(MusicProvider):
             headers = {**base_headers, "Range": f"bytes={pos}-{end}"}
             received = 0
             async with self.mass.http_session.get(url, headers=headers) as response:
-                if response.status == 403:
-                    # googlevideo caps the range size and the cap has already
-                    # moved once (10 MiB worked, then didn't). Nothing has
-                    # been yielded for this request, so retrying the same
-                    # position with a smaller ask is safe; only when the floor
-                    # still 403s is the URL itself the problem.
-                    if chunk_size > STREAM_CHUNK_FLOOR:
-                        chunk_size = max(chunk_size // 2, STREAM_CHUNK_FLOOR)
-                        self.logger.debug(
-                            "403 for a %d-byte range on %s; retrying bytes %d- "
-                            "with %d-byte chunks",
-                            end - pos + 1,
-                            streamdetails.item_id,
-                            pos,
-                            chunk_size,
-                        )
-                        continue
-                    # The strongest signal this provider has that the URL is
-                    # dead (expired, or enforcement changed again). Name the
-                    # position: a 403 at byte 0 and a 403 mid-track are
-                    # different bugs.
-                    raise UnplayableMediaError(
-                        f"googlevideo answered 403 at bytes {pos}-{end} for "
-                        f"{streamdetails.item_id} even at the "
-                        f"{STREAM_CHUNK_FLOOR}-byte floor"
+                refused = response.status == 403
+                # googlevideo caps the range size and the cap has already
+                # moved once (10 MiB worked, then didn't). Nothing has been
+                # yielded for this request, so retrying the same position with
+                # a smaller ask is safe; only when the floor still 403s is the
+                # URL itself the problem.
+                if refused and chunk_size > STREAM_CHUNK_FLOOR:
+                    chunk_size = max(chunk_size // 2, STREAM_CHUNK_FLOOR)
+                    self.logger.debug(
+                        "403 for a %d-byte range on %s; retrying bytes %d- "
+                        "with %d-byte chunks",
+                        end - pos + 1,
+                        streamdetails.item_id,
+                        pos,
+                        chunk_size,
                     )
+                    continue
                 if response.status == 416:
                     # Asked past the end of the file: a Content-Range total
                     # that overstated the size. Everything real was streamed.
                     return
-                response.raise_for_status()
-                if total is None and response.status == 206:
-                    total = _content_range_total(response.headers.get("Content-Range"))
-                async for part in response.content.iter_chunked(STREAM_YIELD_SIZE):
-                    received += len(part)
-                    yield part
+                if not refused:
+                    response.raise_for_status()
+                    if total is None and response.status == 206:
+                        total = _content_range_total(response.headers.get("Content-Range"))
+                    async for part in response.content.iter_chunked(STREAM_YIELD_SIZE):
+                        received += len(part)
+                        yield part
+            if refused:
+                # The URL itself has stopped serving, most likely the partway
+                # cap described at MAX_STREAM_URL_REFRESHES. Handled outside
+                # the response block so the connection is released before the
+                # extraction, which takes seconds.
+                if refreshes >= MAX_STREAM_URL_REFRESHES or not data.get("video_id"):
+                    # Name the position: a 403 at byte 0 and a 403 mid-track
+                    # are different bugs.
+                    in_a_row = f", on {refreshes + 1} urls in a row" if refreshes else ""
+                    raise UnplayableMediaError(
+                        f"googlevideo answered 403 at bytes {pos}-{end} for "
+                        f"{streamdetails.item_id} even at the "
+                        f"{STREAM_CHUNK_FLOOR}-byte floor{in_a_row}"
+                    )
+                refreshes += 1
+                url, base_headers = await self._fresh_stream_url(
+                    streamdetails, url, pos, refreshes
+                )
+                chunk_size = STREAM_CHUNK_SIZE
+                continue
+            if received:
+                refreshes = 0
             if response.status == 200:
                 # The server ignored the Range header and the whole body just
                 # streamed out in one response. Asking again would replay it.
@@ -2831,6 +2870,78 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 pos += received
                 continue
             pos = end + 1
+
+    async def _fresh_stream_url(
+        self, streamdetails: StreamDetails, stale_url: str, pos: int, attempt: int
+    ) -> tuple[str, dict[str, str]]:
+        """Resolve a new URL for a stream whose URL stopped serving at ``pos``.
+
+        get_audio_stream carries on at ``pos`` on the new URL. That is only
+        sound when both URLs serve the very same file, so the encode has to
+        match (_stream_encode); a mismatch raises instead, because splicing two
+        different files would decode as noise from that byte on.
+
+        The new URL is also written back onto ``streamdetails``. Music
+        Assistant serves a seek by streaming the same StreamDetails again from
+        byte 0, and that restart should begin on the URL that works.
+        """
+        data = streamdetails.data
+        video_id = data["video_id"]
+        self.logger.debug(
+            "Stream url for %s stopped serving at byte %d; resolving a fresh one "
+            "(attempt %d of %d)",
+            streamdetails.item_id,
+            pos,
+            attempt,
+            MAX_STREAM_URL_REFRESHES,
+        )
+        stream_format = await self._get_stream_format(video_id)
+        url = stream_format["url"]
+        stale_encode = _stream_encode(stale_url)
+        fresh_encode = _stream_encode(url)
+        if stale_encode is None or fresh_encode != stale_encode:
+            raise UnplayableMediaError(
+                f"the stream url for {streamdetails.item_id} stopped serving at "
+                f"byte {pos}, and the fresh one serves a different file "
+                f"(itag, clen, lmt: {fresh_encode} instead of {stale_encode}), "
+                "so playback cannot resume on it"
+            )
+        await self._sit_out_preroll(stream_format, video_id)
+        headers = dict(stream_format.get("http_headers") or {})
+        data["url"] = url
+        data["headers"] = headers
+        return url, headers
+
+    async def _sit_out_preroll(self, stream_format: dict[str, Any], video_id: str) -> None:
+        """Hold a freshly resolved URL back until its pre-roll ad window is over.
+
+        Fetching inside the window returns 403 (issue #51), so this runs for
+        the URL a track starts on and for every replacement get_audio_stream
+        resolves while it plays.
+        """
+        if not self._preroll_supported:
+            return
+        wait = _preroll_wait_seconds(stream_format)
+        if not wait:
+            return
+        if wait > MAX_PREROLL_WAIT:
+            self.logger.warning(
+                "Track %s reports a %.0fs pre-roll window, beyond the %.0fs "
+                "we are willing to hold playback for. Handing the url over "
+                "now; it will most likely be refused with a 403 and the "
+                "track skipped.",
+                video_id,
+                wait,
+                MAX_PREROLL_WAIT,
+            )
+            return
+        self.logger.debug(
+            "Waiting %.1fs for the pre-roll ad window on track %s before "
+            "handing over the stream url",
+            wait,
+            video_id,
+        )
+        await asyncio.sleep(wait)
 
     # ------------------------------------------------------------------
     # Library methods (require authentication)

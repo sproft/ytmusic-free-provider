@@ -2653,6 +2653,7 @@ class _FakeGoogleVideo:
         send_content_range: bool = True,
         truncate_first: int | None = None,
         max_range: int | None = None,
+        caps: dict[str, int] | None = None,
     ):
         self.blob = blob
         self.ignore_range = ignore_range
@@ -2662,6 +2663,10 @@ class _FakeGoogleVideo:
         # 403, the way googlevideo does since 2026-08 (1 MiB passed, 2 MiB
         # did not, measured against a real ANDROID_VR URL).
         self.max_range = max_range
+        # The position cap, per URL: any range reaching byte caps[url] or
+        # beyond answers 403, from the first request on. Since 2026-10 some
+        # googlevideo URLs serve only the first minute or so of the file.
+        self.caps = caps or {}
         self.requests: list[tuple[str, dict]] = []
 
     def get(self, url, headers=None, **_kwargs):
@@ -2675,6 +2680,8 @@ class _FakeGoogleVideo:
         start_s, end_s = rng[len("bytes=") :].split("-")
         start, end = int(start_s), int(end_s)
         if self.max_range is not None and (end - start + 1) > self.max_range:
+            return _RangeResponse(403)
+        if url in self.caps and end >= self.caps[url]:
             return _RangeResponse(403)
         if start >= len(self.blob):
             return _RangeResponse(416)
@@ -2696,12 +2703,18 @@ def _stream_all(provider, sd) -> bytes:
     return asyncio.run(_collect())
 
 
-def _custom_stream_details(url="https://stream.example/x", headers=None):
+def _custom_stream_details(url="https://stream.example/x", headers=None, video_id=None):
     from music_assistant_models.streamdetails import StreamDetails
 
-    return StreamDetails(
-        provider="test", item_id="vid42", data={"url": url, "headers": headers or {}}
-    )
+    data = {"url": url, "headers": headers or {}}
+    if video_id is not None:
+        data["video_id"] = video_id
+    return StreamDetails(provider="test", item_id="vid42", data=data)
+
+
+def _googlevideo_url(name, *, itag="251", clen="24", lmt="1759700000000000"):
+    """A stream URL carrying the parameters that identify the file behind it."""
+    return f"https://rr1.googlevideo.example/videoplayback?u={name}&itag={itag}&clen={clen}&lmt={lmt}"
 
 
 def _mass_with_session(session):
@@ -2721,11 +2734,14 @@ def test_get_stream_details_is_custom_and_carries_url_and_headers(provider):
         }
 
     provider._get_stream_format = _fmt
-    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+    sd = asyncio.run(provider.get_stream_details("abc12345678@15-222", MediaType.TRACK))
     assert sd.stream_type == StreamType.CUSTOM
     assert sd.data == {
         "url": "https://stream.example/x",
         "headers": {"User-Agent": "com.google.android.apps.youtube.vr"},
+        # Bare, without the trim window: it is what a fresh URL is resolved
+        # from when this one stops serving partway.
+        "video_id": "abc12345678",
     }
     # Kept for logging and the live canary, not for playback.
     assert sd.path == "https://stream.example/x"
@@ -2876,6 +2892,151 @@ def test_get_audio_stream_gives_up_only_below_the_floor(provider, monkeypatch):
         "bytes=0-7",
         "bytes=0-3",
     ]
+
+
+# ---------------------------------------------------------------------------
+# URLs that stop serving partway
+#
+# Since 2026-10 some googlevideo URLs serve only the first minute or so of the
+# file and refuse every range past it. The track used to stop there and Music
+# Assistant skipped to the next one. The cap belongs to the single URL, so
+# get_audio_stream resolves a fresh one for the same file and carries on from
+# the byte where the capped one stopped.
+# ---------------------------------------------------------------------------
+
+
+def _resolver(*formats):
+    """Stand-in for _get_stream_format that hands out ``formats`` in order."""
+    calls = []
+    queue = list(formats)
+
+    async def _fmt(video_id):
+        calls.append(video_id)
+        return queue.pop(0)
+
+    return _fmt, calls
+
+
+def test_get_audio_stream_resumes_on_a_fresh_url_when_the_url_stops_serving(
+    provider, monkeypatch
+):
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    blob = bytes(range(24))
+    capped, fresh = _googlevideo_url("capped"), _googlevideo_url("fresh")
+    session = _FakeGoogleVideo(blob, caps={capped: 10})
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, calls = _resolver(
+        {"url": fresh, "http_headers": {"User-Agent": "fresh-client"}}
+    )
+    sd = _custom_stream_details(capped, {"User-Agent": "first-client"}, video_id="abc12345678")
+
+    out = _stream_all(provider, sd)
+
+    # Seamless: every byte once, in order, across the two URLs.
+    assert out == blob
+    assert calls == ["abc12345678"]
+    sent = [(url, h["Range"]) for url, h in session.requests]
+    # bytes 0-7 from the capped URL, then 8-15 and the floor-sized 8-11 both
+    # reach the cap. The fresh URL picks up at byte 8 with full-size chunks.
+    assert sent == [
+        (capped, "bytes=0-7"),
+        (capped, "bytes=8-15"),
+        (capped, "bytes=8-11"),
+        (fresh, "bytes=8-15"),
+        (fresh, "bytes=16-23"),
+    ]
+    assert all(h["User-Agent"] == "fresh-client" for url, h in session.requests if url == fresh)
+    # A seek restarts the same StreamDetails from byte 0; it should start on
+    # the URL that works.
+    assert sd.data["url"] == fresh
+    assert sd.data["headers"] == {"User-Agent": "fresh-client"}
+
+
+def test_get_audio_stream_will_not_splice_a_different_file(provider, monkeypatch):
+    """Same track, different encode: its bytes do not line up with what played."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 8)
+    capped = _googlevideo_url("capped")
+    reencoded = _googlevideo_url("fresh", lmt="1759799999999999")
+    session = _FakeGoogleVideo(bytes(24), caps={capped: 8})
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, _ = _resolver({"url": reencoded})
+
+    with pytest.raises(UnplayableMediaError, match="different file"):
+        _stream_all(provider, _custom_stream_details(capped, video_id="abc12345678"))
+    assert all(url == capped for url, _ in session.requests)
+
+
+def test_get_audio_stream_gives_up_when_fresh_urls_make_no_progress(provider, monkeypatch):
+    """A cap on every URL in a row is the video, not bad luck; stop resolving."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 8)
+    monkeypatch.setattr(ytm, "MAX_STREAM_URL_REFRESHES", 3)
+    urls = [_googlevideo_url(f"u{i}") for i in range(4)]
+    session = _FakeGoogleVideo(bytes(24), caps=dict.fromkeys(urls, 8))
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, calls = _resolver(*({"url": url} for url in urls[1:]))
+
+    with pytest.raises(UnplayableMediaError, match="on 4 urls in a row"):
+        _stream_all(provider, _custom_stream_details(urls[0], video_id="abc12345678"))
+    assert len(calls) == 3
+
+
+def test_get_audio_stream_only_counts_refreshes_that_made_no_progress(provider, monkeypatch):
+    """A long track may need more fresh URLs than the limit, as long as each helps."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 4)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    monkeypatch.setattr(ytm, "MAX_STREAM_URL_REFRESHES", 1)
+    blob = bytes(range(24))
+    # Each URL serves exactly one 4-byte chunk further than the one before.
+    urls = [_googlevideo_url(f"u{i}") for i in range(6)]
+    session = _FakeGoogleVideo(blob, caps={url: 4 * (i + 1) for i, url in enumerate(urls)})
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, calls = _resolver(*({"url": url} for url in urls[1:]))
+
+    out = _stream_all(provider, _custom_stream_details(urls[0], video_id="abc12345678"))
+
+    assert out == blob
+    assert len(calls) == 5
+
+
+def test_get_audio_stream_waits_out_the_preroll_of_a_fresh_url(provider, monkeypatch):
+    """A fresh URL can come with its own ad window, and fetching inside it 403s."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 8)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 8)
+    events = []
+
+    async def _fake_sleep(seconds):
+        events.append(("sleep", round(seconds)))
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+    blob = bytes(range(24))
+    capped, fresh = _googlevideo_url("capped"), _googlevideo_url("fresh")
+    session = _FakeGoogleVideo(blob, caps={capped: 8})
+    real_get = session.get
+
+    def _get(url, headers=None, **kwargs):
+        events.append(("get", url))
+        return real_get(url, headers=headers, **kwargs)
+
+    session.get = _get
+    provider.mass = _mass_with_session(session)
+    provider._get_stream_format, _ = _resolver({"url": fresh, "available_at": time.time() + 5})
+
+    out = _stream_all(provider, _custom_stream_details(capped, video_id="abc12345678"))
+
+    assert out == blob
+    assert events.index(("sleep", 5)) < events.index(("get", fresh))
+
+
+def test_stream_encode_identifies_the_file_behind_a_url():
+    url = _googlevideo_url("x", itag="140", clen="3433755", lmt="1766955883819090")
+    assert ytm._stream_encode(url) == ("140", "3433755", "1766955883819090")
+    # Anything short of all three cannot vouch for byte-identical files.
+    assert ytm._stream_encode("https://rr1.googlevideo.example/videoplayback?itag=251") is None
+    assert ytm._stream_encode("https://stream.example/x") is None
+    assert ytm._stream_encode(None) is None
 
 
 def test_content_range_total_parses_and_rejects():
