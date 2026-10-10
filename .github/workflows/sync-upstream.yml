@@ -1,0 +1,97 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 20 * * *" # Daily 05:17 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Enable explicitly in the fork; never create PRs against the upstream repo.
+    if: github.repository == 'meitetu/ytmusic-free-provider' && vars.ENABLE_UPSTREAM_SYNC == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ytmusic-free-provider
+          # The App needs Contents, Pull requests and Workflows write access
+          # to this repository only. It has no Home Assistant credentials.
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Fetch upstream and prepare PR branch
+        id: prepare
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/sproft/ytmusic-free-provider.git
+          git fetch --no-tags upstream main
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          upstream_sha=$(git rev-parse upstream/main)
+          branch="sync/upstream-$upstream_sha"
+          if git merge-base --is-ancestor "$upstream_sha" origin/main; then
+            echo 'status=unchanged' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Existing branches/PRs are left for review; no force pushes.
+          if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            count=$(gh pr list --repo "$GITHUB_REPOSITORY" --state all --head "$branch" --json number --jq length)
+            if [ "$count" != 0 ]; then
+              echo "Already prepared $branch; review the existing PR."
+              echo 'status=existing' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Recover a previous successful push followed by failed PR creation.
+            git switch --detach "origin/$branch"
+            if git cat-file -e "HEAD:.github/upstream-conflicts/$upstream_sha.md" 2>/dev/null; then
+              status=conflict
+            else
+              git merge-base --is-ancestor "$upstream_sha" HEAD
+              status=merged
+            fi
+            printf 'status=%s\nbranch=%s\nupstream=%s\n' "$status" "$branch" "$upstream_sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python .github/scripts/prepare_upstream_sync.py origin/main upstream/main > /tmp/upstream-sync.json
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' /tmp/upstream-sync.json >> "$GITHUB_OUTPUT"
+
+      - name: Push only to the fork and open a PR
+        if: steps.prepare.outputs.status == 'merged' || steps.prepare.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SYNC_BRANCH: ${{ steps.prepare.outputs.branch }}
+          SYNC_STATUS: ${{ steps.prepare.outputs.status }}
+          UPSTREAM_SHA: ${{ steps.prepare.outputs.upstream }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+          {
+            printf 'Upstream: https://github.com/sproft/ytmusic-free-provider/commit/%s\n\n' "$UPSTREAM_SHA"
+            printf 'Result: %s. Japanese locale/cache patches must remain covered by CI.\n\n' "$SYNC_STATUS"
+            printf 'Conflicts are never resolved automatically. A conflict PR contains only a report and must stay in draft until manually resolved.\n'
+          } > /tmp/upstream-pr-body.md
+          args=()
+          if [ "$SYNC_STATUS" = conflict ]; then args+=(--draft); fi
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
+            --title "Sync upstream ${UPSTREAM_SHA:0:12}" --body-file /tmp/upstream-pr-body.md "${args[@]}"
+

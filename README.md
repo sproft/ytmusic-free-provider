@@ -1,5 +1,176 @@
 # YouTube Music (Free) Provider
 
+## 日本語対応 Fork（meitetu）
+
+この Fork は `sproft/ytmusic-free-provider` の機能を維持しながら、日本語
+メタデータと本家更新用 PR を追加します。以下の手順では必ず
+`--repo-owner meitetu` を指定してください。省略すると本家を取得し、日本語化
+パッチのないコードに戻る可能性があります。以下は HAOS 18 系向けの手順ですが、
+実機の表示・再生・コンテナ再作成は、このクラウド環境では検証していません。
+
+### メタデータの言語・地域
+
+Music Assistant の設定 → プロバイダー → YouTube Music (Free) の
+**メタデータ言語 / Metadata language** を選択し、保存・再読み込みします。
+
+| 選択 | ytmusicapi | HTTP Accept-Language |
+| --- | --- | --- |
+| 日本語（既定、既存設定で未指定の場合も同じ） | `language="ja", location="JP"` | `ja-JP,ja;q=0.9,en;q=0.5` |
+| English | `language="en", location="US"` | `en-US,en;q=0.9` |
+
+`ytmusicapi` は API リクエストの `context.client.hl` / `gl` に言語・地域を設定します。
+匿名・Cookie 認証の双方でヘッダーを合わせます。プレイリストの yt-dlp
+フォールバックにも言語を渡しますが、音声形式の選択や動画 ID、Cookie、
+アカウント番号、ブランドアカウントの設定は変更しません。
+曲・アルバム・アーティスト・プレイリスト名はサービスの返す Unicode 文字列を
+保持します。日本語名が提供されていない場合、原題や英語名が残ります。
+ユーザーが付けたプレイリスト名などを機械翻訳する機能ではありません。
+
+プロバイダーのメタデータキャッシュは、インスタンスと `ja-JP` / `en-US` ごとに
+分離します。変更前のキャッシュは新しいキーから読まれず、期限切れの英語名を
+先に返す動作も避けます。トラック解析のバージョンチェックと、再生時に
+プレイリストキャッシュを迂回する本家の動作は維持します。
+Music Assistant のライブラリ DB に保存済みの名前や他プロバイダーとの統合結果は
+別管理なので、言語変更後にライブラリ同期・項目のメタデータ更新が必要です。
+Cookie や DB を削除してキャッシュを消す必要はありません。
+
+### Home Assistant OS 18 系への導入
+
+事前に Home Assistant のバックアップを取得し、MA の現行バージョンと正常に
+動作している Fork のリリースタグを控えます。日本語化コミットを含む **Fork の
+安定リリース** が公開されてから導入してください。本家からコピーされたタグや、
+日本語化前のリリースを選ばないでください。
+
+推奨は本家の Provider Watcher を再利用する方法です。以下は例であり、
+`VERSION` は実際にテスト済みで公開された Fork の安定リリースタグに置き換えます。
+外部スクリプトをパイプ実行せず、保存して内容を確認してから実行します。
+
+```sh
+VERSION='vX.Y.Z'
+curl -fL --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/meitetu/ytmusic-free-provider/$VERSION/scripts/install_watcher_addon.sh" \
+  -o /tmp/install_watcher_addon.sh
+# 内容を確認後、最新の安定リリースを追跡する Watcher を生成する
+sh /tmp/install_watcher_addon.sh --repo-owner meitetu --release-only --force
+```
+
+Home Assistant のアドオンストアで再読み込みし、ローカルアドオンの
+**Provider Watcher** をインストールします。Docker 操作のため Protection mode
+をオフにし、「起動時に開始」をオンにして起動します。MA コンテナの検出、Python
+パスの検出、プロバイダーの再注入・再起動は本家の Watcher を利用します。
+Supervisor による MA コンテナの再作成後にも、Watcher がコピーを復旧します。
+これは仕組みの説明であり、HAOS 実機での復旧確認を意味しません。
+
+`--release-only` は安定リリースの取得失敗時に停止します。本家の既定動作である
+未検証の `main` へのフォールバックを使いません。`--ref` とは併用できません。
+Watcher の `auto_update` は既定で **false** です。本番の更新は、リリースと CI
+結果を確認してから手動で行ってください。希望する場合だけ HA 側の設定で
+`auto_update: true` と更新間隔を指定します。その場合も取得先は Fork の安定
+リリースです。GitHub Actions から HA に接続・デプロイする処理はありません。
+
+ホスト Docker にアクセスできる Advanced SSH & Web Terminal（Protection mode
+オフ）などでは、単体インストーラも使えます。公式 Terminal & SSH には通常
+Docker アクセスがないため、Watcher の経路を使用してください。
+
+```sh
+curl -fL --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/meitetu/ytmusic-free-provider/$VERSION/scripts/install_provider.sh" \
+  -o /tmp/install_provider.sh
+# 内容を確認してから実行する
+sh /tmp/install_provider.sh --repo-owner meitetu --release-only --force
+```
+
+いずれもプロバイダーのコードだけを置き換え、MA の設定・ライブラリ DB・Cookie
+を移行／初期化しません。追加後に MA のプロバイダー設定で言語を選択します。
+Cookie を GitHub の Secret、Issue、PR、ログに貼らないでください。
+
+### 更新失敗時のロールバック
+
+1. Watcher の `auto_update` を false にし、Watcher を停止します。単体インストーラ
+   と Watcher が異なるコードを交互に注入しないようにします。
+2. Watcher の更新ダウンロード／展開失敗は現在のコードを維持します。取り込み後に
+   動作しなくなった場合は、記録した正常な Fork タグ `GOOD_VERSION` に戻します。
+3. そのタグのインストーラを上記と同様に保存・確認し、
+   `sh /tmp/install_watcher_addon.sh --repo-owner meitetu --ref "$GOOD_VERSION" --force`
+   で Watcher を再生成します。ローカルアドオンを再読み込みし、再ビルドまたは
+   再インストールして、固定タグのバンドルが入ったことを確認してください。
+   インストーラ再実行だけでは、既にインストールしたアドオンのイメージは変わりません。
+4. `auto_update: false` を確認して Watcher を再開します。必要なら同じタグの単体
+   インストーラを `--repo-owner meitetu --ref "$GOOD_VERSION" --force` で実行します。
+5. MA のログの provider version、検索、再生、Cookie 認証、同期を確認します。
+   コードのロールバックは MA 自体の DB 移行を戻しません。MA 本体も更新した場合は
+   Home Assistant のバックアップ復元が必要になる場合があります。
+
+### 本家の毎日同期と CI
+
+`.github/workflows/sync-upstream.yml` は毎日 **05:17 JST** に本家 `main` を取得します
+（Actions の実行時刻には遅延があり得ます）。Fork にのみブランチ・PR を作成し、
+本家への push は行いません。コミット SHA ごとの同期ブランチに通常のマージを
+行い、日本語化パッチを保持します。競合時はマージを中止し、競合ファイルを記した
+レポートだけの **Draft PR** を作ります。`ours` / `theirs` の強制解決は使いません。
+既存の同期ブランチは force push で書き換えません。新しい本家 SHA の PR を使い、
+不要になった古い PR は閉じてください。手動解決時はレポートの SHA をマージし、
+パッチとテストを確認してレポートを削除してから Draft を解除します。
+
+有効化に必要な Fork の GitHub 設定:
+
+- Fork で Actions と scheduled workflows を有効化し、既定ブランチを `main` にする。
+- この Fork だけにインストールした GitHub App を用意する。Repository permissions は
+  **Contents: write、Pull requests: write、Workflows: write**（本家の workflow 更新も
+  ブランチに push するため）、Metadata は既定の read のみ。HA の資格情報は不要。
+- Actions Variables に `SYNC_APP_ID` と `ENABLE_UPSTREAM_SYNC=true`、Actions Secret に
+  `SYNC_APP_PRIVATE_KEY` を登録する。秘密鍵は GitHub の安全な設定欄だけに入力する。
+  App の短命トークンはこのリポジトリだけに限定され、ジョブ終了時に失効する。
+- `main` のブランチ保護で PR、最新 base に対するステータスチェック **required** を
+  必須にし、管理者・App を含む bypass と force push を許可しない。sync PR の
+  ソース変更・workflow 変更もレビューする。
+- 自動マージを希望する場合のみリポジトリの Allow auto-merge と
+  `UPSTREAM_AUTO_MERGE=true` を有効にする。既定は手動マージ。
+
+通常の `GITHUB_TOKEN` で PR を作ると後続 CI が起動しないため、同期には App を
+使用します。自動マージ用 workflow は `test` の成功と集約ジョブ `required` の
+成功を確認し、同じ Fork・ブランチ・**検証した HEAD SHA** の非 Draft PR にだけ
+マージを要求します。競合レポートのある PR は対象外です。特権のある
+`workflow_run` 内では PR のコードやアーティファクトを実行しません。
+
+CI は Python 構文・Ruff の致命的エラー／未定義名チェック、既存・日本語化テスト、
+実モデルの契約、stable サーバーイメージへのインポート・言語キャッシュ契約、
+dash/bash/Alpine BusyBox のインストーラ・Watcher テストを実行します。
+beta/nightly のサーバー互換性は本家同様に参考チェックです。Watcher テストが
+生成不能で全部 skip された場合は CI を失敗させます。
+Fork では未検証の rolling イメージ（edge/beta/nightly）の自動公開を停止します。
+明示的なタグによる安定リリースとその Docker イメージ公開は、必須 CI 成功後に限られます。
+テスト失敗・未実行・キャンセルでは公開しません。
+
+リリースは自動同期から自動生成しません。レビュー・マージ後、未使用の安定
+バージョンへ `__version__` を更新して CI を通し、その値と一致する新しい `v*`
+タグを Fork に push すると `release.yml` が再度 CI を実行して公開します。
+既存の本家タグを付け替えないでください。自動マージは HA の自動更新とは別です。
+
+### ローカル検証と実機で必要な確認
+
+```sh
+python -m pytest tests/python
+MA_MODELS_REQUIRED=1 python -m pytest tests/python_integration
+python -m unittest discover -s tests/sync -v
+python -m compileall -q ytmusic_free tests .github/scripts
+ruff check --select E9,F63,F7,F82 ytmusic_free tests .github/scripts
+```
+
+日本語テストは実際の `ytmusicapi` を使い、通信だけをテスト内に置き換えて、API
+の `hl=ja` / `gl=JP`、ヘッダー、Cookie・アカウント情報の引き継ぎを検証します。
+名前の保持と検索・同期、yt-dlp フォールバックはフィクスチャによる検証です。
+これらは YouTube 実データや HAOS の画面を検証したことにはなりません。
+実機導入後は同一曲を日本語・英語で検索し、曲・アルバム・アーティスト・
+プレイリスト名、再生、Cookie 認証の同期、コンテナ再作成時の復旧、更新失敗後の
+ロールバックを確認してください。Google が両言語の名前を提供する曲を選びます。
+
+---
+
+以下は本家の説明です。Fork の言語設定・取得先・安全な配布については上記の
+日本語手順を優先してください。本家の rolling イメージ公開の説明は Fork には
+適用されません。
+
 An independent, community-built provider that adds free YouTube Music streaming to the open-source [Music Assistant](https://github.com/music-assistant/server) media server, using the same technique as open-source players like [SimpMusic](https://github.com/maxrave-dev/SimpMusic).
 
 > [!IMPORTANT]

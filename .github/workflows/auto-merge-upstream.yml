@@ -1,0 +1,52 @@
+name: Merge tested upstream PR
+
+on:
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  enable-auto-merge:
+    if: >-
+      github.repository == 'meitetu/ytmusic-free-provider' &&
+      vars.UPSTREAM_AUTO_MERGE == 'true' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      # Privileged workflow_run: never checkout or execute code/artifacts from
+      # the PR. Read metadata only, and match the exact head validated by CI.
+      - name: Enable merge only for a successfully tested sync head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > /tmp/run.json
+          sha=$(jq -r '.head_sha' /tmp/run.json)
+          branch=$(jq -r '.head_branch' /tmp/run.json)
+          case "$branch" in sync/upstream-*) ;; *) exit 0 ;; esac
+          # Resolve PRs from current API state, not untrusted event text.
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+            --head "$branch" --json number,headRefOid,headRepository,isCrossRepository,isDraft > /tmp/prs.json
+          number=$(jq -r --arg sha "$sha" --arg repo "$GITHUB_REPOSITORY" \
+            '[.[] | select(.headRefOid == $sha and .headRepository.nameWithOwner == $repo and .isCrossRepository == false and .isDraft == false)] | if length == 1 then .[0].number else empty end' /tmp/prs.json)
+          [ -n "$number" ] || exit 0
+          # A report-only conflict PR must not merge even if marked ready.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$number/files" \
+            --jq '.[].filename' > /tmp/changed-paths
+          if grep -q '^\.github/upstream-conflicts/' /tmp/changed-paths; then exit 0; fi
+          # Confirm the aggregate gate really passed; a zero-job run is not CI.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.name == "required") | .conclusion' > /tmp/required-result
+          [ "$(cat /tmp/required-result)" = success ] || exit 1
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --merge --match-head-commit "$sha"

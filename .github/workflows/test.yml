@@ -29,7 +29,22 @@ on:
   # So a drift check can be run on demand rather than waiting for the cron.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  code-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install ruff==0.14.0
+      - run: python -m compileall -q ytmusic_free tests .github/scripts
+      - run: ruff check --select E9,F63,F7,F82 ytmusic_free tests .github/scripts
+      - run: python -m unittest discover -s tests/sync -v
+
   shell:
     runs-on: ubuntu-latest
     steps:
@@ -57,13 +72,13 @@ jobs:
         run: |
           dash tests/test_install_watcher_addon.sh
           dash tests/test_install_provider.sh
-          dash tests/test_watcher_autoupdate.sh
+          REQUIRE_WATCHER_TESTS=1 dash tests/test_watcher_autoupdate.sh
 
       - name: Run installer test suite (bash, for parity)
         run: |
           bash tests/test_install_watcher_addon.sh
           bash tests/test_install_provider.sh
-          bash tests/test_watcher_autoupdate.sh
+          REQUIRE_WATCHER_TESTS=1 bash tests/test_watcher_autoupdate.sh
 
   busybox:
     # Runs the suite inside Alpine, which uses BusyBox ash + BusyBox utilities
@@ -85,7 +100,7 @@ jobs:
                    && busybox --help 2>&1 | head -1 \
                    && sh tests/test_install_watcher_addon.sh \
                    && sh tests/test_install_provider.sh \
-                   && sh tests/test_watcher_autoupdate.sh'
+                   && REQUIRE_WATCHER_TESTS=1 sh tests/test_watcher_autoupdate.sh'
 
   python:
     runs-on: ubuntu-latest
@@ -205,3 +220,24 @@ jobs:
           # asserts and why.
           docker run --rm -i --entrypoint /app/venv/bin/python \
             local-test-image:${{ matrix.ma_version }} - < tests/verify_server_contract.py
+          docker run --rm -i --entrypoint /app/venv/bin/python \
+            local-test-image:${{ matrix.ma_version }} - < tests/verify_localization_contract.py
+
+  required:
+    name: required
+    if: always()
+    needs: [code-checks, shell, busybox, python, models-contract, docker-lint-and-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every mandatory CI job to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ["RESULTS"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
+          if failed:
+              sys.exit(f"Required CI jobs failed or did not run: {failed}")
+          print("All required CI jobs passed")
+          PY

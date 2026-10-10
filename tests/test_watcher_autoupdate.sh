@@ -26,6 +26,10 @@ fi
 TMP_ADDONS="$(mktemp -d)"
 if [ "${SKIP_NETWORK_TESTS:-0}" = "1" ] || ! sh "$SCRIPT" --force \
         --addons-dir "$TMP_ADDONS" --ma-id addon_test --python-version python3.14 >/dev/null 2>&1; then
+    if [ "${REQUIRE_WATCHER_TESTS:-0}" = "1" ]; then
+        fail "required watcher tests could not generate add-on"
+        exit 1
+    fi
     skip "could not generate add-on (offline or skipped) -- auto-update tests skipped"
     printf '\n== Summary ==\n  passed: %s\n  failed: %s\n  skipped: %s\n' "$PASS" "$FAIL" "$SKIP"
     exit 0

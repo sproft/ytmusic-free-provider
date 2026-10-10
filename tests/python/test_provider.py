@@ -315,7 +315,7 @@ def test_create_ytmusic_client_passes_headers_and_brand_account_through(provider
     captured = {}
 
     class _FakeYTMusic:
-        def __init__(self, auth=None, user=None):
+        def __init__(self, auth=None, user=None, **kwargs):
             captured["auth"] = auth
             captured["user"] = user
 
@@ -343,7 +343,9 @@ def test_create_ytmusic_client_anonymous_passes_no_auth(provider, monkeypatch):
     monkeypatch.setattr(ytm.importlib, "import_module", lambda name: fake_module)
 
     provider._create_ytmusic_client()
-    assert captured["called_with"] == {}
+    assert "auth" not in captured["called_with"]
+    assert captured["language"] == "ja"
+    assert captured["location"] == "JP"
 
 
 class _StubConfig:
@@ -1676,6 +1678,7 @@ def test_get_config_entries_returns_expected_keys():
     entries = asyncio.run(ytm.get_config_entries(mass=None))
     keys = [e.key for e in entries]
     assert keys == [
+        ytm.CONF_METADATA_LANGUAGE,
         ytm.CONF_AUTH_TYPE,
         ytm.CONF_COOKIE,
         ytm.CONF_BRAND_ACCOUNT,
@@ -1726,7 +1729,7 @@ def test_instance_get_config_entries_needs_no_init(provider):
     config reads, and no async-init state."""
     provider._ytmusic = None
     entries = asyncio.run(provider.get_config_entries())
-    assert len(entries) == 8
+    assert len(entries) == 9
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ PROVIDER_DIR="ytmusic_free"
 # branch, tag or commit. Installing a release rather than branch head is what
 # makes an install reproducible and lets a bug report name a version. See #68.
 REF=""
+RELEASE_ONLY=0
 FORCE=0
 MA_ID=""
 PYTHON_VERSION=""
@@ -67,10 +68,14 @@ latest_release_tag() {
 # so. The message is deliberately loud, because an install that silently means
 # something different from what the docs promise is how support threads start.
 resolve_ref() {
+    if [ "$RELEASE_ONLY" = "1" ] && [ -n "$REF" ]; then
+        die "--release-only cannot be combined with --ref; pin a reviewed tag explicitly without --release-only"
+    fi
     [ -n "$REF" ] && return 0
     if REF="$(latest_release_tag)" && [ -n "$REF" ]; then
         log "Installing the latest release: $REF"
     else
+        [ "$RELEASE_ONLY" = "0" ] || die "No stable release could be resolved; refusing to install unverified branch head"
         REF="main"
         log "WARN: could not resolve a published release (none yet, or GitHub"
         log "      unreachable). Falling back to branch head: $REF"
@@ -106,6 +111,7 @@ Usage: sh install_provider.sh [options]
 Options:
   --force, -f               Skip overwrite prompts
   --repo-owner OWNER        Repository owner (default: sproft)
+  --release-only            Require a stable release; never fall back to main
   --ref REF                 Git ref (branch/tag/commit) to download
                             (default: the newest published release; use
                             --ref main to track branch head instead)
@@ -123,6 +129,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --force|-f) FORCE=1 ;;
         --repo-owner) shift; REPO_OWNER="${1:-}" ;;
+        --release-only) RELEASE_ONLY=1 ;;
         --ref) shift; REF="${1:-}" ;;
         --ma-id) shift; MA_ID="${1:-}" ;;
         --python-version) shift; PYTHON_VERSION="${1:-}" ;;

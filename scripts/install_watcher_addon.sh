@@ -42,6 +42,7 @@ ADDON_VERSION="$ADDON_VERSION_LINE.$(date +%Y%m%d%H%M%S)"
 # Empty means "resolve the newest published release". --ref pins to a branch,
 # tag or commit, and pinning also stops auto-update from following releases.
 REF=""
+RELEASE_ONLY=0
 FORCE=0
 MA_ID=""
 PYTHON_VERSION=""
@@ -79,6 +80,9 @@ latest_release_tag() {
 # releases as soon as it can reach GitHub again.
 TRACK_RELEASES=0
 resolve_ref() {
+    if [ "$RELEASE_ONLY" = "1" ] && [ -n "$REF" ]; then
+        die "--release-only cannot be combined with --ref; pin a reviewed tag explicitly without --release-only"
+    fi
     if [ -n "$REF" ]; then
         log "Pinned to --ref $REF; auto-update will follow it rather than releases."
         return 0
@@ -87,6 +91,7 @@ resolve_ref() {
     if REF="$(latest_release_tag)" && [ -n "$REF" ]; then
         log "Installing the latest release: $REF"
     else
+        [ "$RELEASE_ONLY" = "0" ] || die "No stable release could be resolved; refusing to install unverified branch head"
         REF="main"
         log "WARN: could not resolve a published release (none yet, or GitHub"
         log "      unreachable). Falling back to branch head: $REF"
@@ -113,7 +118,8 @@ Usage: sh install_watcher_addon.sh [options]
 Options:
   --force, -f               Overwrite existing add-on directory without prompting
   --repo-owner OWNER        Repository owner (default: sproft)
-  --ref REF                 Branch to download; auto-update follows this branch head (default: main)
+  --release-only            Require a stable release; never fall back to main
+  --ref REF                 Pin a branch/tag/commit (default: latest stable release)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
   --addons-dir DIR          Local add-ons directory (default: auto-detect HAOS vs. Supervised)
@@ -125,6 +131,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --force|-f) FORCE=1 ;;
         --repo-owner) shift; REPO_OWNER="${1:-}" ;;
+        --release-only) RELEASE_ONLY=1 ;;
         --ref) shift; REF="${1:-}" ;;
         --ma-id) shift; MA_ID="${1:-}" ;;
         --python-version) shift; PYTHON_VERSION="${1:-}" ;;

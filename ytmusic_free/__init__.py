@@ -35,6 +35,7 @@ import re
 import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -356,6 +357,12 @@ DURATION_WORDS_RE = re.compile(
 )
 
 CONF_AUTH_TYPE = "auth_type"
+CONF_METADATA_LANGUAGE = "metadata_language"
+DEFAULT_METADATA_LANGUAGE = "ja-JP"
+METADATA_LOCALES = {
+    "ja-JP": ("ja", "JP", "ja-JP,ja;q=0.9,en;q=0.5"),
+    "en-US": ("en", "US", "en-US,en;q=0.9"),
+}
 CONF_COOKIE = "cookie_header"
 CONF_BRAND_ACCOUNT = "brand_account"
 CONF_AUTH_USER = "auth_user"
@@ -1046,6 +1053,32 @@ async def get_config_entries(
     return _build_config_entries()
 
 
+def use_metadata_cache(expiration: int, **cache_options):
+    """Keep MA's cache/bypass behavior, with a locale in every metadata key.
+
+    The server's checksum is static, so it cannot represent per-instance
+    language settings. A keyword consumed inside the cached wrapper separates
+    locales and excludes pre-localization entries, including expired ones.
+    Parser-version checksums and playlist playback bypass still apply.
+    """
+    def decorate(func):
+        @wraps(func)
+        async def localized(self, *args, _metadata_locale: str, **kwargs):
+            return await func(self, *args, **kwargs)
+
+        cached = use_cache(expiration, **cache_options)(localized)
+
+        @wraps(cached)
+        async def wrapper(self, *args, **kwargs):
+            return await cached(
+                self, *args, _metadata_locale=self._metadata_locale, **kwargs
+            )
+
+        return wrapper
+
+    return decorate
+
+
 def _build_config_entries() -> tuple[ConfigEntry, ...]:
     """The provider's config entries, shared by the 2.9 and 2.10 hooks.
 
@@ -1055,6 +1088,20 @@ def _build_config_entries() -> tuple[ConfigEntry, ...]:
     options page, same as on 2.9.
     """
     return (
+        ConfigEntry(
+            key=CONF_METADATA_LANGUAGE,
+            type=ConfigEntryType.STRING,
+            label="メタデータ言語 / Metadata language",
+            default_value=DEFAULT_METADATA_LANGUAGE,
+            required=False,
+            options=(
+                ConfigValueOption(title="日本語 (日本 / ja-JP)", value="ja-JP"),
+                ConfigValueOption(title="English (United States / en-US)", value="en-US"),
+            ),
+            description="YouTube Music のメタデータ言語と地域。保存後にプロバイダーを"
+            "再読み込みしてください。既存ライブラリの表示は再同期・更新が必要です。"
+            "Names depend on translations available from YouTube; this does not translate them.",
+        ),
         ConfigEntry(
             key=CONF_AUTH_TYPE,
             type=ConfigEntryType.STRING,
@@ -1467,11 +1514,41 @@ class YoutubeMusicFreeProvider(MusicProvider):
     def _create_ytmusic_client(
         self, auth: dict[str, str] | None = None, user: str | None = None
     ):
-        """Create a YTMusic client, optionally with authentication."""
+        """Create a localized YTMusic client with the same auth and timeout."""
+        import requests
+
         ytmusicapi = importlib.import_module("ytmusicapi")
+        language, location, accept_language = METADATA_LOCALES[self._metadata_locale]
+        # Public requests_session support avoids mutating ytmusicapi internals
+        # or doing an extra homepage request just to set anonymous headers.
+        session = requests.Session()
+        session.headers["Accept-Language"] = accept_language
+        session.request = partial(session.request, timeout=30)
+        options = {"language": language, "location": location, "requests_session": session}
         if auth:
-            return ytmusicapi.YTMusic(auth=auth, user=user)
-        return ytmusicapi.YTMusic()
+            options.update(auth=auth, user=user)
+        try:
+            return ytmusicapi.YTMusic(**options)
+        except Exception:
+            session.close()
+            raise
+
+    @property
+    def _metadata_locale(self) -> str:
+        """Use Japanese for existing configurations without the new option."""
+        value = self.config.get_value(CONF_METADATA_LANGUAGE) if self.config else None
+        value = value or DEFAULT_METADATA_LANGUAGE
+        if value not in METADATA_LOCALES:
+            raise InvalidDataError("Unsupported metadata language; select ja-JP or en-US")
+        return value
+
+    def _metadata_ytdlp_options(self) -> dict:
+        """Localize playlist fallback metadata without changing stream selection."""
+        language, _, accept_language = METADATA_LOCALES[self._metadata_locale]
+        return {
+            "http_headers": {"Accept-Language": accept_language},
+            "extractor_args": {"youtube": {"lang": [language]}},
+        }
 
     @property
     def instance_name_postfix(self) -> str | None:
@@ -1590,7 +1667,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             "accept": "*/*",
-            "accept-language": "en-US,en;q=0.5",
+            "accept-language": METADATA_LOCALES[self._metadata_locale][2],
             "content-type": "application/json",
             "x-goog-authuser": str(auth_user),
             "x-origin": YTM_DOMAIN,
@@ -1927,7 +2004,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 )
         return results
 
-    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
+    @use_metadata_cache(CATALOG_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id.
 
@@ -1981,7 +2058,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         track.version = f"{track.version} [{trim_label}]".strip() if track.version else f"[{trim_label}]"
         return track
 
-    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
     async def get_album(self, prov_album_id: str) -> Album:
         """Get full album details by id."""
         album_obj = await asyncio.to_thread(self._ytmusic.get_album, prov_album_id)
@@ -1989,7 +2066,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             raise MediaNotFoundError(f"Album {prov_album_id} not found")
         return self._parse_album(album_obj, prov_album_id)
 
-    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
+    @use_metadata_cache(CATALOG_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get album tracks for given album id."""
         album_obj = await asyncio.to_thread(self._ytmusic.get_album, prov_album_id)
@@ -2034,7 +2111,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self.logger.debug("get_artist failed for %s: %s", prov_artist_id, err)
             return None
 
-    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
         # Fake IDs created when artist channel ID is unknown — return a stub.
@@ -2075,7 +2152,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except Exception as e:
             raise MediaNotFoundError(f"Artist {prov_artist_id} not found") from e
 
-    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of albums for the given artist."""
         artist_obj = await self._fetch_artist_obj(prov_artist_id)
@@ -2091,7 +2168,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 albums.append(self._parse_album(album_obj, album_obj.get("browseId")))
         return albums
 
-    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
+    @use_metadata_cache(ARTIST_CACHE_TTL, allow_expired_cache=True, cache_checksum=TRACK_CACHE_VERSION)
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get a list of most popular tracks for the given artist."""
         artist_obj = await self._fetch_artist_obj(prov_artist_id)
@@ -2129,7 +2206,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             raise MediaNotFoundError(f"Podcast {prov_podcast_id} not found")
         return podcast_obj
 
-    @use_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
         """Get full podcast details by id."""
         podcast_id = _strip_podcast_browse_prefix(prov_podcast_id)
@@ -2151,7 +2228,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 position = episode_obj.get("index") or index
                 yield self._parse_podcast_episode(episode_obj, podcast, position)
 
-    @use_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
         """Get a single podcast episode by its composite id."""
         podcast_id, video_id = _split_episode_id(prov_episode_id)
@@ -2200,7 +2277,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             podcast_id or episode_obj.get("playlistId") or "unknown",
         )
 
-    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get full playlist details by id."""
         try:
@@ -2328,7 +2405,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
         return self._drop_ai_tracks(result, f"mix {playlist_id}")
 
-    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Return playlist tracks for the given playlist id.
 
@@ -2505,6 +2582,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 "no_warnings": True,
                 "extract_flat": "in_playlist",
                 "playlistend": 1,
+                **self._metadata_ytdlp_options(),
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
@@ -2565,6 +2643,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 "quiet": True,
                 "no_warnings": True,
                 "extract_flat": True,
+                **self._metadata_ytdlp_options(),
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
@@ -2614,7 +2693,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 pass
         return result
 
-    @use_cache(SIMILAR_TRACKS_CACHE_TTL, allow_expired_cache=True)
+    @use_metadata_cache(SIMILAR_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Return a dynamic list of tracks based on the provided track (song radio).
 
