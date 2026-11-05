@@ -121,7 +121,7 @@ Note the `sh -s --` separator, as with the watcher installer below; `curl ... | 
 
 > **No Docker in your shell?** On Home Assistant OS the watcher add-on route does not need Docker in your terminal: run `install_watcher_addon.sh` (see below), then install and start the **Provider Watcher** local add-on with Protection mode off. It injects the provider for you and keeps it installed across restarts.
 
-Then jump to step 4 below to add the provider in the MA UI, and see [WATCHER_ADDON.md](WATCHER_ADDON.md) (or the quick installer further down) to make the install survive HA restarts.
+Then jump to step 4 below to add the music source in the MA UI, and see [WATCHER_ADDON.md](WATCHER_ADDON.md) (or the quick installer further down) to make the install survive HA restarts.
 
 ### Manual install
 
@@ -162,9 +162,9 @@ docker restart "$MA"
 
 > **Important:** Restarting MA from the Home Assistant UI recreates the container from its image, wiping any files you copied in. Always use `docker restart` to preserve the provider files.
 
-### 4. Add the provider in MA
+### 4. Add the music source in MA
 
-Go to **Settings → Apps → Add** in the MA UI. You should see **"YouTube Music (Free)"** listed. No credentials are required for basic playback.
+Go to **Settings → Music sources → Add** in the MA UI. You should see **"YouTube Music (Free)"** listed there (it is a music source, so it does not appear under player providers). No credentials are required for basic playback.
 
 ### Adding more than one account
 
