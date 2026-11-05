@@ -87,6 +87,8 @@ from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.util import infer_album_type, install_package, parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
+from .playback_cookies import load_playback_cookies
+
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
@@ -3805,9 +3807,14 @@ class YoutubeMusicFreeProvider(MusicProvider):
         return self._drop_ai_items(tracks, source)
 
     async def _get_stream_format(self, item_id: str) -> dict[str, Any]:
-        """Extract the best audio stream URL via yt-dlp (no cookies required)."""
+        """Extract audio using the selected session, or anonymously."""
 
         prefer_quality = self._prefer_quality
+        cookie_header = (
+            (self.config.get_value(CONF_COOKIE) or "").strip()
+            if self.config and self.config.get_value(CONF_AUTH_TYPE) == AUTH_TYPE_COOKIE
+            else ""
+        )
         # Defensive: strip any trim suffix so yt-dlp always sees a bare video id.
         video_id, _, _ = _split_track_id(item_id)
 
@@ -3856,6 +3863,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 },
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    load_playback_cookies(ydl, cookie_header)
+                except ValueError as err:
+                    raise UnplayableMediaError(str(err)) from None
                 try:
                     info = ydl.extract_info(url, download=False)
                 except yt_dlp.utils.DownloadError as err:

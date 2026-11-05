@@ -12,7 +12,7 @@ An independent, community-built provider that adds free YouTube Music streaming 
 | `ytmusicapi` | Search, metadata, and library sync (optional auth) |
 | `yt-dlp` | Extract direct audio stream URLs and playlist tracks |
 
-Audio stream URLs are resolved without a login. Which of YouTube's internal clients does that resolving is left to yt-dlp's own defaults rather than pinned here, because the client that works anonymously keeps moving: the Android Music client this provider originally named has since been removed from yt-dlp entirely, and the Android and iOS clients now require a PO token, which an anonymous session cannot supply. yt-dlp tracks that target for us. This is the same general approach used by NewPipe and SimpMusic on Android.
+Audio stream URLs use the configured browser cookie when authentication is set to **Browser cookie**; **None (anonymous)** leaves extraction anonymous. Each extraction uses a separate, in-memory cookie jar scoped to HTTPS YouTube requests. Cookies are neither written to a file nor forwarded as a global header to media CDN hosts. This also applies when an expired audio URL is refreshed. YouTube's internal client selection is left to yt-dlp's defaults rather than pinned here, because the clients that work keep changing.
 
 For playlists, `yt-dlp` is used as a fallback when `ytmusicapi` cannot parse the unauthenticated playlist response from YouTube, ensuring playlists work without a login.
 
