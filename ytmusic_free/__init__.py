@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 import asyncio
 import importlib
@@ -213,6 +213,16 @@ RADIO_PLAYLIST_LIMIT = 100
 # playback and refill, so it only ever affects what you are looking at, never
 # what you are hearing. Same figure the official ytmusic provider uses.
 PLAYLIST_TRACKS_CACHE_TTL = 3 * 3600
+
+# Stored as the cache checksum on the playlist lookups (get_playlist,
+# get_playlist_tracks). Music Assistant treats an entry whose checksum differs
+# as a miss, so bumping this when a change to _parse_playlist alters what a
+# playlist contains retires each old entry on its next lookup instead of at the
+# end of PLAYLIST_TRACKS_CACHE_TTL. Without it a parsing fix can stay invisible
+# on a live install for hours: the empty ids fixed below kept being served from
+# the cache until they expired.
+# 2: keep the requested playlist id when the detail payload omits it.
+PLAYLIST_CACHE_VERSION = "2"
 
 # Catalogue metadata: an album's title, artwork and release year do not change
 # after it is published, and an artist's discography changes a few times a year
@@ -2268,7 +2278,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
             podcast_id or episode_obj.get("playlistId") or "unknown",
         )
 
-    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
+    @use_cache(
+        PLAYLIST_TRACKS_CACHE_TTL,
+        allow_expired_cache=True,
+        cache_checksum=PLAYLIST_CACHE_VERSION,
+    )
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get full playlist details by id."""
         try:
@@ -2277,7 +2291,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
             if not playlist_obj:
                 raise MediaNotFoundError(f"Playlist {prov_playlist_id} not found")
-            return self._parse_playlist(playlist_obj)
+            return self._parse_playlist(playlist_obj, fallback_id=prov_playlist_id)
         except MediaNotFoundError:
             raise
         except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
@@ -2396,7 +2410,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
         return self._drop_ai_tracks(result, f"mix {playlist_id}")
 
-    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
+    @use_cache(
+        PLAYLIST_TRACKS_CACHE_TTL,
+        allow_expired_cache=True,
+        cache_checksum=PLAYLIST_CACHE_VERSION,
+    )
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Return playlist tracks for the given playlist id.
 
@@ -4139,13 +4157,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
             artist.metadata.images = self._parse_thumbnails(artist_obj["thumbnails"])
         return artist
 
-    def _parse_playlist(self, playlist_obj: dict, *, keep_small_frame: bool = False) -> Playlist:
+    def _parse_playlist(
+        self,
+        playlist_obj: dict,
+        *,
+        keep_small_frame: bool = False,
+        fallback_id: str | None = None,
+    ) -> Playlist:
         """Parse a YTM playlist dict into a Playlist model object.
 
         ``keep_small_frame`` is for home feed cards (issue #96). Elsewhere a
         playlist whose only cover is a video frame gets Music Assistant's
         generated collage instead, but a recommendation card gets no collage,
         so there the frame beats no artwork at all.
+
+        ``fallback_id`` supplies the id when the payload carries none.
+        ``get_playlist()`` returns detail objects that sometimes omit
+        ``id``/``playlistId``/``browseId`` altogether (measured on
+        channel-owned playlists). The resulting empty item id made the item
+        unplayable: Music Assistant resolved the URI to ``<provider>://playlist/``
+        and then raised "No playable items found", and importing it into the
+        library failed on an ``assert item_id``.
         """
         # ytmusicapi uses different key names depending on context:
         #   get_playlist()  → "id"
@@ -4154,7 +4186,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
         playlist_id = (
             playlist_obj.get("id")
             or playlist_obj.get("playlistId")
-            or playlist_obj.get("browseId", "")
+            or playlist_obj.get("browseId")
+            or fallback_id
+            or ""
         )
         # ytmusicapi sends the title as None when a home feed card has none.
         playlist_name = playlist_obj.get("title") or "Unknown Playlist"
