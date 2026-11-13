@@ -349,6 +349,7 @@ playlist links.)
 **Playlist shows "No playable items found"**
 - Ensure you are on the latest version of this provider (playlist support uses a yt-dlp fallback added after the initial release).
 - Very large playlists may take a few seconds to load as yt-dlp fetches the track list.
+- If the playlist still lists and opens in the UI but its URI ends at `playlist/` with nothing after it, YouTube's detail response carried no playlist id and earlier versions parsed that into an empty one. 1.2.4 keeps the id the request was made with, and the cache entry retires on the first lookup after the update, so no manual cache clear is needed.
 
 **Album release years, and how often this provider calls YouTube**
 - Catalogue lookups (albums, artists, tracks, playlists) are cached: albums and tracks for 30 days, artists for 7, song radio for 1 day, playlists for 3 hours. Nothing about a released album changes, and the previous behaviour of re-fetching on every render was both slow and a good way to get rate-limited.

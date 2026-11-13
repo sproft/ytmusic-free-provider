@@ -1380,6 +1380,35 @@ def test_parse_playlist_falls_back_to_browse_id(provider):
     assert playlist.item_id == "VLPL456"
 
 
+def test_parse_playlist_falls_back_to_given_id_when_payload_has_none(provider):
+    # get_playlist() detail payloads for channel-owned playlists can omit
+    # id/playlistId/browseId; the requested id is the only source left.
+    playlist = provider._parse_playlist({"title": "P"}, fallback_id="VLPL789")
+    assert playlist.item_id == "VLPL789"
+    mappings = list(playlist.provider_mappings)
+    assert [m.item_id for m in mappings] == ["VLPL789"]
+
+
+def test_parse_playlist_prefers_payload_id_over_given_id(provider):
+    playlist = provider._parse_playlist(
+        {"id": "PL123", "title": "P"}, fallback_id="VLPL789"
+    )
+    assert playlist.item_id == "PL123"
+
+
+def test_get_playlist_keeps_requested_id_when_payload_omits_it(provider, monkeypatch):
+    client = MagicMock()
+    client.get_playlist = MagicMock(
+        return_value={"title": "P", "author": "Channel", "trackCount": 3}
+    )
+    monkeypatch.setattr(provider, "_ytmusic", client)
+
+    playlist = asyncio.run(provider.get_playlist("VLPL789"))
+
+    assert playlist.item_id == "VLPL789"
+    assert client.get_playlist.call_args.args[0] == "VLPL789"
+
+
 def test_parse_playlist_owner_string(provider):
     playlist = provider._parse_playlist(
         {"id": "PL", "title": "P", "author": "Some User"}
