@@ -1381,32 +1381,45 @@ def test_parse_playlist_falls_back_to_browse_id(provider):
 
 
 def test_parse_playlist_falls_back_to_given_id_when_payload_has_none(provider):
-    # get_playlist() detail payloads for channel-owned playlists can omit
-    # id/playlistId/browseId; the requested id is the only source left.
-    playlist = provider._parse_playlist({"title": "P"}, fallback_id="VLPL789")
-    assert playlist.item_id == "VLPL789"
+    # ytmusicapi keeps the key and sends "id": None when the header's play
+    # button carries no watchEndpoint (measured on the issue #103 playlist);
+    # the requested id is the only source left.
+    playlist = provider._parse_playlist({"id": None, "title": "P"}, fallback_id="PL789")
+    assert playlist.item_id == "PL789"
     mappings = list(playlist.provider_mappings)
-    assert [m.item_id for m in mappings] == ["VLPL789"]
+    assert [m.item_id for m in mappings] == ["PL789"]
+    assert [m.url for m in mappings] == [f"{ytm.YTM_DOMAIN}/playlist?list=PL789"]
 
 
 def test_parse_playlist_prefers_payload_id_over_given_id(provider):
     playlist = provider._parse_playlist(
-        {"id": "PL123", "title": "P"}, fallback_id="VLPL789"
+        {"id": "PL123", "title": "P"}, fallback_id="PL789"
     )
     assert playlist.item_id == "PL123"
 
 
-def test_get_playlist_keeps_requested_id_when_payload_omits_it(provider, monkeypatch):
+@pytest.mark.parametrize("requested", ["VLPL789", "PL789"])
+def test_get_playlist_keeps_requested_id_when_payload_omits_it(provider, monkeypatch, requested):
+    """Both request forms land on the bare id.
+
+    Search hands over "VLPL...", while payloads that carry an id and the
+    library listing use "PL...". Keeping the browse prefix would give one
+    playlist two ids, and the library sync would never match the VL one.
+    """
     client = MagicMock()
     client.get_playlist = MagicMock(
-        return_value={"title": "P", "author": "Channel", "trackCount": 3}
+        return_value={"id": None, "title": "P", "author": "Channel", "trackCount": 3}
     )
     monkeypatch.setattr(provider, "_ytmusic", client)
 
-    playlist = asyncio.run(provider.get_playlist("VLPL789"))
+    playlist = asyncio.run(provider.get_playlist(requested))
 
-    assert playlist.item_id == "VLPL789"
-    assert client.get_playlist.call_args.args[0] == "VLPL789"
+    assert playlist.item_id == "PL789"
+    assert [m.url for m in playlist.provider_mappings] == [
+        f"{ytm.YTM_DOMAIN}/playlist?list=PL789"
+    ]
+    # The request itself goes out exactly as Music Assistant asked for it.
+    assert client.get_playlist.call_args.args[0] == requested
 
 
 def test_parse_playlist_owner_string(provider):
@@ -4368,6 +4381,21 @@ def test_track_caches_carry_the_parser_version(method):
     assert args.get("cache_checksum") == ytm.TRACK_CACHE_VERSION
 
 
+@pytest.mark.parametrize("method", ["get_playlist", "get_playlist_tracks"])
+def test_playlist_caches_carry_the_playlist_version(method):
+    """A playlist cached by an older release becomes a miss after an update.
+
+    Without the checksum the empty ids of 1.2.3 (issue #103) stayed cached for
+    up to PLAYLIST_TRACKS_CACHE_TTL, and Music Assistant then served them once
+    more as stale data before refreshing.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    args = getattr(YoutubeMusicFreeProvider, method).__ma_cache__
+    assert ytm.PLAYLIST_CACHE_VERSION
+    assert args.get("cache_checksum") == ytm.PLAYLIST_CACHE_VERSION
+
+
 @pytest.mark.parametrize("method", ["get_album", "get_artist", "get_artist_albums"])
 def test_album_and_artist_caches_survive_a_track_parser_bump(method):
     """The album-year lookup runs get_album up to 40 times per page (#53).
@@ -4731,6 +4759,47 @@ def test_get_playlist_tracks_skips_unavailable_tracks(provider):
     assert [track.item_id for track in tracks] == ["available"]
 
 
+def test_get_playlist_tracks_fills_from_ytdlp_when_no_entry_is_playable(provider):
+    """Issue #103: YouTube Music greyed out every episode of a playlist.
+
+    All 42 entries came back with ``videoId`` None and ``isAvailable`` False
+    while youtube.com plays the same videos. The raw list matched trackCount,
+    so the undercount test never fired; only "nothing parsed" shows that the
+    yt-dlp listing is needed.
+    """
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(
+        return_value={
+            "id": None,
+            "trackCount": 2,
+            "tracks": [
+                {
+                    "videoId": None,
+                    "title": f"Folge {number}",
+                    "artists": [{"id": "UC1", "name": "A"}],
+                    "isAvailable": False,
+                }
+                for number in (1, 2)
+            ],
+        }
+    )
+    provider._ytmusic = mock
+    seen = {}
+
+    async def _fallback(playlist_id, seed_video_id=None):
+        seen["playlist_id"] = playlist_id
+        seen["seed"] = seed_video_id
+        return [provider._minimal_track(track_id) for track_id in ("dlp_1", "dlp_2")]
+
+    provider._get_playlist_tracks_via_ytdlp = _fallback
+
+    tracks = asyncio.run(provider.get_playlist_tracks("PLgreyed"))
+
+    assert [track.item_id for track in tracks] == ["dlp_1", "dlp_2"]
+    # Nothing parsed, so there is no seed to hand over.
+    assert seen == {"playlist_id": "PLgreyed", "seed": None}
+
+
 # ---------------------------------------------------------------------------
 # Private playlists (issue #82): the yt-dlp fallback can never read them
 # ---------------------------------------------------------------------------
@@ -4776,6 +4845,26 @@ def test_get_playlist_tracks_lm_undercount_never_runs_ytdlp(provider):
     tracks = asyncio.run(provider.get_playlist_tracks("LM"))
 
     assert [track.item_id for track in tracks] == ["liked_1", "liked_2"]
+
+
+def test_get_playlist_tracks_private_with_nothing_playable_never_runs_ytdlp(provider):
+    """The issue #103 fill must not reach private playlists either.
+
+    Liked songs can hold nothing but unavailable entries, and yt-dlp would
+    only log a misleading "playlist does not exist" for them (issue #82).
+    """
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(
+        return_value={
+            "trackCount": 1,
+            "tracks": [{"videoId": None, "title": "Gone", "isAvailable": False}],
+        }
+    )
+    provider._ytmusic = mock
+    fallback = MagicMock(side_effect=AssertionError("yt-dlp fallback should not run"))
+    provider._get_playlist_tracks_via_ytdlp = fallback
+
+    assert asyncio.run(provider.get_playlist_tracks("LM")) == []
 
 
 def test_get_playlist_tracks_lm_failure_raises_instead_of_going_empty(provider):

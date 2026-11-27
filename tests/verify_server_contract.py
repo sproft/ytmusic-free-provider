@@ -30,11 +30,13 @@ import re
 
 # Parameters of ``music_assistant.controllers.cache.use_cache`` that the provider
 # passes. It decorates twelve methods, every one of them as
-# ``@use_cache(<int>, allow_expired_cache=True)``. Four also pass
+# ``@use_cache(<int>, allow_expired_cache=True)``. Six also pass
 # ``cache_checksum``: the three long-lived lookups that return tracks, so a
-# parser change can retire their 30-day entries (issue #90), and the home feed,
-# so a change of its row limit retires the shorter feed (issue #96). Losing any
-# of these names is a TypeError raised while the class body executes.
+# parser change can retire their 30-day entries (issue #90), the home feed, so
+# a change of its row limit retires the shorter feed (issue #96), and the two
+# playlist lookups, so a playlist parsing fix retires their entries (issue
+# #103). Losing any of these names is a TypeError raised while the class body
+# executes.
 REQUIRED_USE_CACHE_PARAMS = ("expiration", "allow_expired_cache", "cache_checksum")
 
 # Not passed by the provider, and that is exactly why it needs asserting here.
